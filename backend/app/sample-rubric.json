@@ -1,0 +1,24 @@
+{
+  "title": "Photosynthesis quiz",
+  "questions": [
+    {
+      "id": "Q1",
+      "text": "Explain how photosynthesis converts light into chemical energy. (4 marks)",
+      "criteria": [
+        {"id": "inputs", "description": "States that carbon dioxide and water are the inputs (reactants)", "marks": 1},
+        {"id": "outputs", "description": "States that glucose and oxygen are produced", "marks": 1},
+        {"id": "chlorophyll", "description": "Explains that chlorophyll in the chloroplasts absorbs light energy", "marks": 1},
+        {"id": "equation", "description": "Gives a correct balanced equation: 6CO2 + 6H2O -> C6H12O6 + 6O2 (words or symbols)", "marks": 1}
+      ]
+    },
+    {
+      "id": "Q2",
+      "text": "A car travels 150 km in 2.5 hours. Calculate its average speed. (3 marks)",
+      "criteria": [
+        {"id": "formula", "description": "Uses speed = distance / time", "marks": 1},
+        {"id": "substitution", "description": "Substitutes the correct values (150 and 2.5)", "marks": 1},
+        {"id": "answer", "description": "Correct answer of 60 km/h with unit", "marks": 1}
+      ]
+    }
+  ]
+}
