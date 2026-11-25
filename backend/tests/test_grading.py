@@ -120,14 +120,60 @@ def test_ollama_provider_request_shape(monkeypatch):
     from PIL import Image
     buf = io.BytesIO(); Image.new("RGB", (3000, 2000), "white").save(buf, "PNG")
     seen = {}
-    def fake_post(url, json=None, timeout=None, **kw):
+    import contextlib
+    @contextlib.contextmanager
+    def fake_stream(method, url, json=None, timeout=None, **kw):
         seen.update(url=url, body=json)
         class R:
             status_code = 200
-            def json(self): return {"message": {"content": '{"ok": 1}'}}
-        return R()
-    monkeypatch.setattr(httpx, "post", fake_post)
+            def iter_lines(self):  # two streamed chunks, as Ollama sends them
+                yield '{"message": {"content": "{\\"ok\\""}}'
+                yield '{"message": {"content": ": 1}"}, "done": true}'
+        yield R()
+    monkeypatch.setattr(httpx, "stream", fake_stream)
     monkeypatch.setenv("LLM_PROVIDER", "ollama")
     assert llm.generate_json("hi", [(buf.getvalue(), "image/png")]) == {"ok": 1}
     assert seen["url"].endswith("/api/chat") and seen["body"]["format"] == "json" and len(seen["body"]["messages"][0]["images"]) == 1
     assert llm.available()
+
+
+def test_openrouter_skips_failed_model_and_sends_image(monkeypatch):
+    import io, httpx
+    from PIL import Image
+    buf = io.BytesIO(); Image.new("RGB", (2000, 1000), "white").save(buf, "PNG")
+    calls = []
+    def fake_post(url, json=None, headers=None, timeout=None, **kw):
+        calls.append(json["model"])
+        class R:
+            status_code = 429 if len(calls) == 1 else 200
+            text = "rate limited"
+            def json(self): return {"choices": [{"message": {"content": '{"ok": 2}'}}]}
+        seen_content.append(json["messages"][0]["content"])
+        return R()
+    seen_content = []
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    monkeypatch.setenv("OPENROUTER_MODEL", "a:free,b:free")
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    assert llm.generate_json("hi", [(buf.getvalue(), "image/png")]) == {"ok": 2}
+    assert calls == ["a:free", "b:free"] and seen_content[0][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_auto_order_gemini_then_openrouter_then_ollama(monkeypatch):
+    order = []
+    def mk(name, fail):
+        def f(*a, **k):
+            order.append(name)
+            if fail: raise llm.LLMError(name)
+            return {"from": name}
+        return f
+    monkeypatch.setenv("LLM_PROVIDER", "auto")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    monkeypatch.setattr(llm, "_call", lambda *a, **k: (order.append("gemini"), (_ for _ in ()).throw(llm.LLMError("g")))[1])
+    monkeypatch.setattr(llm, "_openrouter", mk("openrouter", True))
+    monkeypatch.setattr(llm, "_ollama", mk("ollama", False))
+    assert llm.generate_json("hi") == {"from": "ollama"} and order == ["gemini", "openrouter", "ollama"]
+    order.clear()
+    monkeypatch.setattr(llm, "_openrouter", mk("openrouter", False))  # OpenRouter answers: Ollama is never called
+    assert llm.generate_json("hi") == {"from": "openrouter"} and order == ["gemini", "openrouter"]

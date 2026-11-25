@@ -14,7 +14,7 @@ class LLMError(RuntimeError):
 
 def _model() -> str:
     # comma-separated: when one model's free daily quota is used up, the next one is tried
-    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash,gemini-flash-latest,gemini-flash-lite-latest")
+    return os.getenv("GEMINI_MODEL", "gemini-3.5-flash,gemini-3.6-flash,gemini-3-flash-preview,gemini-3.1-flash-lite,gemini-flash-lite-latest")
 
 
 def default_provider() -> str:
@@ -22,30 +22,70 @@ def default_provider() -> str:
 
 
 def available() -> bool:
-    return default_provider() in ("ollama", "auto") or bool(os.getenv("GEMINI_API_KEY"))
+    return default_provider() in ("ollama", "auto") or bool(os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY"))
 
 
-def _ollama(prompt: str, images: list[tuple[bytes, str]] | None) -> dict:
-    """Local model through Ollama's native API. Pages are downscaled: CPU inference time grows with pixels."""
+def _jpegs(images: list[tuple[bytes, str]] | None) -> list[str]:
+    """Pages downscaled to 1600px JPEG, base64: smaller uploads, and CPU inference time grows with pixels."""
     import io
     from PIL import Image
-    b64 = []
+    out = []
     for data, _ in images or []:
         im = Image.open(io.BytesIO(data)).convert("RGB")
         im.thumbnail((1600, 1600))
         buf = io.BytesIO()
         im.save(buf, "JPEG", quality=90)
-        b64.append(base64.b64encode(buf.getvalue()).decode())
-    body = {"model": os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b"), "stream": False, "format": "json",
+        out.append(base64.b64encode(buf.getvalue()).decode())
+    return out
+
+
+def _openrouter(prompt: str, images: list[tuple[bytes, str]] | None) -> dict:
+    """OpenRouter free models (e.g. NVIDIA Nemotron VL). OpenAI-style API; a model that is rate limited or down is skipped."""
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        raise LLMError("OPENROUTER_API_KEY is not set. Free key (no card): https://openrouter.ai/keys")
+    content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b}} for b in _jpegs(images)]
+    last = ""
+    for model in [m.strip() for m in os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-super-vl:free,nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,google/gemma-4-31b-it:free").split(",") if m.strip()]:
+        body = {"model": model, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": content}]}
+        try:
+            r = httpx.post("https://openrouter.ai/api/v1/chat/completions", json=body, headers={"Authorization": f"Bearer {key}"}, timeout=180)
+        except httpx.HTTPError as e:
+            last = f"{model}: network error {e}"
+            continue
+        if r.status_code != 200:
+            last = f"{model}: HTTP {r.status_code} {r.text[:120]}"
+            continue
+        try:
+            return parse_json(r.json()["choices"][0]["message"]["content"] or "")
+        except (KeyError, IndexError, ValueError, TypeError, LLMError) as e:
+            last = f"{model}: unusable reply ({type(e).__name__})"
+    raise LLMError(f"Every OpenRouter model failed (last: {last})")
+
+
+def _ollama(prompt: str, images: list[tuple[bytes, str]] | None) -> dict:
+    """Local model through Ollama's native API."""
+    b64 = _jpegs(images)
+    # stream: tokens flow as they are made, so a tunnel/proxy (Cloudflare cuts silent requests at ~100 s) never sees an idle connection
+    body = {"model": os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b"), "stream": True, "format": "json", "keep_alive": "30m",
             "options": {"temperature": 0, "num_ctx": 8192},
             "messages": [{"role": "user", "content": prompt, **({"images": b64} if b64 else {})}]}
+    url = os.getenv("OLLAMA_URL", "http://localhost:11434")
     try:
-        r = httpx.post(os.getenv("OLLAMA_URL", "http://localhost:11434") + "/api/chat", json=body, timeout=1800)
+        with httpx.stream("POST", url + "/api/chat", json=body, timeout=httpx.Timeout(1800, connect=20)) as r:
+            if r.status_code != 200:
+                r.read()
+                raise LLMError(f"Ollama error {r.status_code}: {r.text[:300]} (model pulled? `ollama pull {body['model']}`)")
+            text = ""
+            for line in r.iter_lines():
+                if line.strip():
+                    part = json.loads(line)
+                    if part.get("error"):
+                        raise LLMError(f"Ollama error: {part['error']}")
+                    text += part.get("message", {}).get("content", "")
     except httpx.HTTPError as e:
-        raise LLMError(f"Cannot reach Ollama at {os.getenv('OLLAMA_URL', 'http://localhost:11434')} ({e}). Is `ollama serve` running?")
-    if r.status_code != 200:
-        raise LLMError(f"Ollama error {r.status_code}: {r.text[:300]} (model pulled? `ollama pull {body['model']}`)")
-    return parse_json(r.json()["message"]["content"])
+        raise LLMError(f"Cannot reach Ollama at {url} ({e}). Is `ollama serve` running and the tunnel up?")
+    return parse_json(text)
 
 
 def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, retries: int = 6, provider: str | None = None) -> dict:
@@ -53,11 +93,19 @@ def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, re
     prov = provider or default_provider()
     if prov == "ollama":
         return _ollama(prompt, images)
-    if prov == "auto":  # Gemini first; if it is out of quota or down, use the local model
+    if prov == "openrouter":
+        return _openrouter(prompt, images)
+    if prov == "auto":  # Gemini first; then OpenRouter's free models (if a key is set); last, the local model
         try:
             return generate_json(prompt, images, retries, provider="gemini")
         except LLMError:
-            return _ollama(prompt, images)
+            pass
+        if os.getenv("OPENROUTER_API_KEY"):
+            try:
+                return _openrouter(prompt, images)
+            except LLMError:
+                pass
+        return _ollama(prompt, images)
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise LLMError("GEMINI_API_KEY is not set. Get a free key at https://aistudio.google.com/apikey and put it in .env")
