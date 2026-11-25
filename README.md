@@ -108,6 +108,7 @@ Deployed on Render's free tier from this repository's Dockerfile. Configure Neon
 
 - Sample presenter video and handwriting are synthetic (TTS narrator, handwriting-style font). Real footage and real scans are not yet tested.
 - Chroma key suits an evenly lit green background; uneven lighting or green clothing will leak. Use the Green screen selector to force on or off.
+- On a small server, set `GROQ_API_KEY` (hosted Whisper, free) so transcription takes seconds instead of minutes, and `FFMPEG_PRESET=ultrafast` so rendering is faster. Only the compressed audio is sent to Groq.
 - Single render worker, so concurrent video users queue. Neon free storage is about 0.5 GB (check your plan's current limits), and files over `BLOB_MAX_MB` stay on the server disk only, with a warning on the job.
 - No login: anyone with the URL sees all records.
 - Gemini free tier has small daily quotas per model (an evaluation costs 3 calls, a video match 1). The client falls back across `GEMINI_MODEL`'s comma-separated list and gives a clear message when all are used up.

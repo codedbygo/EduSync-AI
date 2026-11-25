@@ -42,7 +42,7 @@ def client(tmp_path_factory, monkeypatch_module=None):
     for k in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
         os.environ.pop(k, None)
     os.environ["LLM_PROVIDER"] = "gemini"
-    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "BLOB_STORE"):
+    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_SECRET_KEY", "BLOB_STORE", "GROQ_API_KEY"):
         os.environ.pop(k, None)
     main.DATA = Path(os.environ["DATA_DIR"])
     with TestClient(main.app) as c:  # runs the lifespan: store.init
@@ -159,3 +159,31 @@ def test_text_never_hidden_behind_presenter(tmp_path):
     x, y = int(1030 * sc), int(660 * sc)                          # left edge of the text box outline, after scaling
     assert min(im.getpixel((x + dx, y + dy)) for dx in range(-3, 4) for dy in range(-3, 4)) < 120   # the text box is visible
     assert x + int(220 * sc) < video.PIP_X                         # and it ends left of the presenter window
+
+
+def test_hosted_transcription_request_and_fallback(monkeypatch):
+    import httpx
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = ""
+        def json(self):
+            return {"segments": [{"start": 0.0, "end": 2.5, "text": " Hello class. "}, {"start": 2.5, "end": 3.0, "text": "  "}]}
+
+    def fake_post(url, headers=None, data=None, files=None, timeout=None):
+        name, f, mime = files["file"]
+        seen.update(url=url, auth=headers["Authorization"], fmt=data["response_format"], mime=mime, head=f.read(4))
+        return R()
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    out = video.transcribe(S / "presenter_greenscreen.mp4")
+    assert out == [{"start": 0.0, "end": 2.5, "text": "Hello class."}]                 # blank segments dropped
+    assert seen["url"].endswith("/audio/transcriptions") and seen["auth"] == "Bearer k" and seen["fmt"] == "verbose_json"
+    assert seen["mime"] == "audio/ogg" and seen["head"] == b"OggS"                     # real Opus audio was extracted
+
+    def down(*a, **k):
+        raise httpx.ConnectError("no route")
+    monkeypatch.setattr(httpx, "post", down)
+    monkeypatch.setattr(video, "_local_transcribe", lambda v: [{"start": 1.0, "end": 2.0, "text": "local"}])
+    assert video.transcribe(S / "presenter_greenscreen.mp4")[0]["text"] == "local"   # hosted failure never fails the job

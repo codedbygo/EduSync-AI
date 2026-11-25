@@ -1,5 +1,6 @@
 """Video + slides sync: slides->PNG, Whisper transcript, LLM slide timing, FFmpeg composite."""
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -70,10 +71,41 @@ def slides_to_images(deck: Path, outdir: Path) -> tuple[list[Path], list[str]]:
 
 
 # ---------- transcript ----------
+def _groq_transcribe(video: Path, key: str) -> list[dict]:
+    """Hosted Whisper (Groq, free tier): seconds instead of minutes on a weak CPU. Only compressed audio is sent."""
+    import tempfile
+    import httpx
+    with tempfile.TemporaryDirectory() as td:
+        audio = Path(td) / "audio.ogg"  # mono 16 kHz Opus ~24 kbps: about 11 MB per hour, under the 25 MB upload limit
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "24k", str(audio)], capture_output=True)
+        if r.returncode != 0:
+            raise VideoError(f"Audio extraction failed: {r.stderr.decode()[-300:]}")
+        if audio.stat().st_size > 24 << 20:
+            raise VideoError("audio too long for the hosted transcriber")
+        with open(audio, "rb") as f:
+            resp = httpx.post("https://api.groq.com/openai/v1/audio/transcriptions", headers={"Authorization": f"Bearer {key}"}, timeout=300,
+                              data={"model": os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"), "response_format": "verbose_json", "temperature": "0"},
+                              files={"file": ("audio.ogg", f, "audio/ogg")})
+    if resp.status_code != 200:
+        raise VideoError(f"Groq transcription failed: HTTP {resp.status_code} {resp.text[:200]}")
+    segs = resp.json().get("segments") or []
+    return [{"start": round(float(s["start"]), 2), "end": round(float(s["end"]), 2), "text": str(s["text"]).strip()} for s in segs if str(s.get("text", "")).strip()]
+
+
 def transcribe(video: Path) -> list[dict]:
+    if key := os.getenv("GROQ_API_KEY"):
+        try:
+            return _groq_transcribe(video, key)
+        except (VideoError, OSError, ValueError, KeyError) as e:  # fall back to the local model; never fail the job over it
+            print(f"Hosted transcription unavailable, using local Whisper: {e}", flush=True)
+        except Exception as e:  # httpx errors and anything unexpected from the network
+            print(f"Hosted transcription unavailable, using local Whisper: {type(e).__name__}", flush=True)
+    return _local_transcribe(video)
+
+
+def _local_transcribe(video: Path) -> list[dict]:
     global _whisper
     from faster_whisper import WhisperModel
-    import os
     if _whisper is None:
         name = os.getenv("WHISPER_MODEL", "base")
         try:  # cached copy first: no network call, so a flaky connection cannot stall transcription
@@ -314,7 +346,7 @@ def render(video: Path, slide_imgs: list[Path], timeline: list[dict], out: Path,
     fc.append(f"[{last}]format=yuv420p[v]")
     cmd = ["ffmpeg", "-y", "-v", "error", "-progress", "pipe:1", "-nostats", *inputs,
            "-filter_complex", ";".join(fc), "-map", "[v]", "-map", "0:a:0",
-           "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+           "-c:v", "libx264", "-preset", os.getenv("FFMPEG_PRESET", "veryfast"), "-crf", "22", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "160k", "-t", f"{duration:.3f}", "-movflags", "+faststart", str(out)]
     progress(0.02, "Rendering video")
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

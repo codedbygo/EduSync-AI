@@ -21,7 +21,7 @@ AI = {"total_score": 4.0, "max_total": 5.0, "needs_review": True, "ocr_confidenc
 
 @pytest.fixture(params=["local", "db"])  # files in a folder, or inside the database (the Neon setup)
 def env(tmp_path, monkeypatch, request):
-    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "OPENROUTER_API_KEY"):
+    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_SECRET_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("BLOB_STORE", request.param)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
