@@ -38,8 +38,10 @@ def test_pptx_conversion():
 def client(tmp_path_factory, monkeypatch_module=None):
     import os
     os.environ["DATA_DIR"] = str(tmp_path_factory.mktemp("data"))
-    os.environ.pop("GEMINI_API_KEY", None)
-    from app import main
+    from app import main  # loads .env first; the lines below then force the "no model available" path
+    for k in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
+        os.environ.pop(k, None)
+    os.environ["LLM_PROVIDER"] = "gemini"
     main.DATA = Path(os.environ["DATA_DIR"])
     return TestClient(main.app)
 

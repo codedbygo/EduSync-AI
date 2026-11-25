@@ -75,7 +75,11 @@ def transcribe(video: Path) -> list[dict]:
     from faster_whisper import WhisperModel
     import os
     if _whisper is None:
-        _whisper = WhisperModel(os.getenv("WHISPER_MODEL", "base"), device="cpu", compute_type="int8")
+        name = os.getenv("WHISPER_MODEL", "base")
+        try:  # cached copy first: no network call, so a flaky connection cannot stall transcription
+            _whisper = WhisperModel(name, device="cpu", compute_type="int8", local_files_only=True)
+        except Exception:
+            _whisper = WhisperModel(name, device="cpu", compute_type="int8")  # not cached yet: download once
     import numpy as np
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"], capture_output=True)
     if raw.returncode != 0:
