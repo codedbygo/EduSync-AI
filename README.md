@@ -97,12 +97,13 @@ Grading (two independent graders): Gemini transcribes the pages (equations as te
 | Host | Backend | FFmpeg | CPU / RAM | Long jobs | Verdict |
 |---|---|---|---|---|---|
 | Hugging Face Spaces (Docker) | yes | yes (apt) | 2 vCPU / 16 GB | | Docker Spaces now need a paid plan for new accounts. |
-| Render free + Neon | yes | via Docker | 0.1 CPU / 512 MB | sleeps after 15 min idle; slow for video, may run out of memory on long clips | **Used.** No card. Records and files in Neon survive restarts. |
+| Own machine + Cloudflare tunnel | yes | yes | your hardware | only while the machine is on; quick-tunnel link changes per start; ~100 MB per upload | **Used for the live demo.** Free, fastest. |
+| Render free + Supabase | yes | via Docker | 0.1 CPU / 512 MB | sleeps after 15 min idle; slow for video, may run out of memory on long clips | Worked (no card); suspended: too slow for video. |
 | Fly.io, Railway | yes | yes | small | require a card | Not free without a card |
 | Vercel / Netlify | serverless only | no | 10 to 60 s limits | no | No (frontend only) |
 | Google Cloud Run | yes | yes | ok | free tier needs a billing account | Needs a card |
 
-Deployed on Render's free tier from this repository's Dockerfile. Configure Neon (see above) so records and files survive Render restarts. Render free has a tenth of a CPU: handwriting grading is fine, video processing of long clips is slow and can run out of memory; keep demo clips short.
+Live demo: the app runs on the author's machine (GPU for the local model, fast transcription and rendering) and is shared through a Cloudflare tunnel (`cloudflared tunnel --url http://localhost:8000`), so the link works only while that machine is on. Records and files are in Supabase (Postgres plus Storage). The same Docker image also ran on Render's free tier against the same Supabase project; that service is suspended because a tenth of a CPU made video processing take many minutes. Render free has a tenth of a CPU: handwriting grading is fine, video processing of long clips is slow and can run out of memory; keep demo clips short.
 
 ## Known limitations
 

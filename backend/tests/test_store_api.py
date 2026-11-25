@@ -165,3 +165,17 @@ def test_postgres_url_uses_psycopg3(monkeypatch, tmp_path):
     assert store._db_url(tmp_path).startswith("postgresql+psycopg://")
     monkeypatch.delenv("DATABASE_URL")
     assert store._db_url(tmp_path).startswith("sqlite:///")
+
+
+def test_restart_only_interrupts_this_servers_jobs(env):
+    with TestClient(main.app) as c:
+        mine, theirs = submit(c, "A"), submit(c, "B")
+        wait(c, f"/api/eval/jobs/{mine}"); wait(c, f"/api/eval/jobs/{theirs}")
+    for jid, owner in ((mine, main.INSTANCE), (theirs, "render")):
+        rec = store.get(jid)
+        rec.update(stage="running", owner=owner)  # both mid-run; "theirs" belongs to another server sharing the database
+        store.save(rec, main.summarize(rec))
+    main.jobs.clear()
+    with TestClient(main.app) as c:
+        assert c.get(f"/api/eval/jobs/{mine}").json()["stage"] == "interrupted"
+        assert c.get(f"/api/eval/jobs/{theirs}").json()["stage"] == "running"

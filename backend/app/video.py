@@ -45,8 +45,8 @@ def has_audio(path: Path) -> bool:
 
 
 # ---------- slides ----------
-def slides_to_images(deck: Path, outdir: Path) -> tuple[list[Path], list[str]]:
-    """PPT/PPTX/PDF -> one PNG per slide + the text of each slide."""
+def slides_to_images(deck: Path, outdir: Path, progress: Callable[[float], None] = lambda f: None) -> tuple[list[Path], list[str]]:
+    """PPT/PPTX/PDF -> one PNG per slide (at the output width) + the text of each slide. A PDF skips LibreOffice."""
     outdir.mkdir(parents=True, exist_ok=True)
     pdf = deck
     if deck.suffix.lower() != ".pdf":
@@ -62,11 +62,12 @@ def slides_to_images(deck: Path, outdir: Path) -> tuple[list[Path], list[str]]:
         raise VideoError("The presentation has no slides.")
     imgs, texts = [], []
     for i, page in enumerate(doc, 1):
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(1600 / page.rect.width, 1600 / page.rect.width))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(W / page.rect.width, W / page.rect.width))  # the video is W wide: more pixels only cost time
         p = outdir / f"slide_{i:03d}.png"
         pix.save(p)
         imgs.append(p)
         texts.append(" ".join(page.get_text().split()))
+        progress(i / doc.page_count)
     return imgs, texts
 
 

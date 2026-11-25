@@ -32,15 +32,16 @@ DATA = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
 MAX_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 CACHE_TTL = 6 * 3600
 STATIC = Path(os.getenv("STATIC_DIR", Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"))
+INSTANCE = os.getenv("INSTANCE_NAME") or __import__("socket").gethostname()  # which server runs a job (laptop and Render can share one database)
 INTERRUPTED = "The server restarted while this job was running, so it stopped. Press Retry to run it again from the stored inputs."
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.init(DATA)
-    for jid in store.running_ids():  # a restart killed these threads: say so instead of showing "running" forever
+    for jid in store.running_ids():  # a restart killed this server's threads: say so instead of showing "running" forever
         rec = store.get(jid)
-        if rec:
+        if rec and rec.get("owner", INSTANCE) == INSTANCE:  # never touch a job another server is running right now
             rec.update(stage="interrupted", error=INTERRUPTED, message="Interrupted")
             store.save(rec, summarize(rec))
     yield
@@ -90,7 +91,7 @@ def new_job(kind: str, **fields) -> tuple[str, Path]:
             jobs.pop(jid)
         jid = uuid.uuid4().hex[:12]
         jobs[jid] = {"id": jid, "kind": kind, "stage": "queued", "progress": 0.0, "message": "Queued", "error": None,
-                     "created": now, "files": {}, **fields}
+                     "created": now, "files": {}, "owner": INSTANCE, **fields}
     d = DATA / jid
     d.mkdir(parents=True, exist_ok=True)
     return jid, d
@@ -227,9 +228,13 @@ def analyse(jid: str, auto_render: bool):
     files = dict(jobs[jid]["files"])
     files["video"] = files.get("video") or keep(jid, f"video/{jid}/{vpath.name}", vpath, "video/mp4")
     files["deck"] = files.get("deck") or keep(jid, f"video/{jid}/{deck.name}", deck, "application/octet-stream")
-    update(jid, files=files, stage="slides", progress=0.05, message="Converting slides to images")
-    imgs, texts = video.slides_to_images(deck, d / "slides")
-    files["slides"] = [k for p in imgs if (k := keep(jid, f"video/{jid}/slides/{p.name}", p, "image/png"))]
+    update(jid, files=files, stage="slides", progress=0.05,
+           message="Converting slides to images" + (" (LibreOffice; a PDF upload skips this step)" if deck.suffix.lower() != ".pdf" else ""))
+    imgs, texts = video.slides_to_images(deck, d / "slides", lambda f: update(jid, progress=0.05 + 0.06 * f, message=f"Drawing slides ({round(f * 100)}%)"))
+    update(jid, progress=0.11, message=f"Saving {len(imgs)} slide images")
+    with ThreadPoolExecutor(8) as ex:  # network bound: parallel uploads instead of one at a time
+        keys = list(ex.map(lambda p: keep(jid, f"video/{jid}/slides/{p.name}", p, "image/png"), imgs))
+    files["slides"] = [k for k in keys if k]
     update(jid, files=files, n_slides=len(imgs), slide_texts=texts, stage="transcribing", progress=0.15, message="Transcribing speech (Whisper)")
     duration = video.probe_duration(vpath)
     segs = video.transcribe(vpath)
@@ -287,7 +292,7 @@ def rerender(jid: str, body: RenderBody):
         raise HTTPException(409, "Job is still busy.")
     if not job.get("files", {}).get("slides") and not (DATA / jid / "slides").exists():
         raise HTTPException(409, "This job has no slides yet. Press Retry first.")
-    update(jid, stage="rendering", error=None, message="Rendering video", progress=0.0)
+    update(jid, stage="rendering", error=None, message="Rendering video", progress=0.0, owner=INSTANCE)
     heavy.submit(runner(jid, render_job, [t.model_dump() for t in body.timeline], body.chroma))
     return {"id": jid}
 
@@ -298,7 +303,7 @@ def retry_video(jid: str):
     if job["stage"] not in ("error", "interrupted"):
         raise HTTPException(409, "Only a failed or interrupted job can be retried.")
     pr = job.get("pending_render")
-    update(jid, stage="queued", error=None, message="Queued", progress=0.0)
+    update(jid, stage="queued", error=None, message="Queued", progress=0.0, owner=INSTANCE)
     if pr:  # it died while rendering: render the same timeline again
         heavy.submit(runner(jid, render_job, pr["timeline"], pr["chroma"]))
     else:
@@ -422,7 +427,7 @@ def retry_eval(jid: str):
     if job["stage"] not in ("error", "interrupted"):
         raise HTTPException(409, "Only a failed or interrupted evaluation can be retried.")
     (DATA / jid).mkdir(parents=True, exist_ok=True)
-    update(jid, stage="queued", error=None, message="Queued", progress=0.0)
+    update(jid, stage="queued", error=None, message="Queued", progress=0.0, owner=INSTANCE)
     light.submit(runner(jid, evaluate_job))
     return {"id": jid}
 

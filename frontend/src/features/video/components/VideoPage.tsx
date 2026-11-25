@@ -54,6 +54,9 @@ export function VideoPage() {
               <Label htmlFor="df">Slides (PPTX, PPT, PDF)</Label>
               <input id="df" type="file" accept=".pptx,.ppt,.pdf,.odp" className={fileCls} onChange={(e) => d.set({ deck: e.target.files?.[0] })} />
               {d.deck && <p className="text-sm text-muted-foreground">Selected: {d.deck.name}</p>}
+              {d.deck && !d.deck.name.toLowerCase().endsWith(".pdf") && (
+                <p className="text-sm text-muted-foreground">Tip: export the deck as PDF first. PowerPoint files need a slow conversion on the server; a PDF skips it.</p>
+              )}
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-4">
