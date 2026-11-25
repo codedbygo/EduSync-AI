@@ -19,7 +19,7 @@ export async function request<T>(url: string, schema: z.ZodType<T>, init?: Reque
     }
     throw new Error(detail)
   }
-  const parsed = schema.safeParse(await res.json())
+  const parsed = schema.safeParse(res.status === 204 ? undefined : await res.json())
   if (!parsed.success) throw new Error("The server sent an unexpected response.")
   return parsed.data
 }

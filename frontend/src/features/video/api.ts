@@ -1,5 +1,6 @@
+import { z } from "zod"
 import { request } from "@/lib/api"
-import { created, videoJob, type TimelineEntry } from "./schemas"
+import { created, videoJob, videoList, type TimelineEntry } from "./schemas"
 
 export const createVideoJob = (video: File, deck: File, autoRender: boolean) => {
   const fd = new FormData()
@@ -10,6 +11,9 @@ export const createVideoJob = (video: File, deck: File, autoRender: boolean) => 
 }
 
 export const fetchVideoJob = (id: string) => request(`/api/video/jobs/${id}`, videoJob)
+export const fetchVideoList = (limit: number) => request(`/api/video/jobs?limit=${limit}`, videoList)
+export const retryVideoJob = (id: string) => request(`/api/video/jobs/${id}/retry`, created, { method: "POST" })
+export const deleteVideoJob = (id: string) => request(`/api/video/jobs/${id}`, z.unknown(), { method: "DELETE" })
 
 export const renderVideoJob = (id: string, timeline: TimelineEntry[], chroma: string) =>
   request(`/api/video/jobs/${id}/render`, created, {

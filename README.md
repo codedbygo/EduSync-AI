@@ -33,15 +33,18 @@ docker run --rm -p 7860:7860 --env-file .env edusync-ai     # http://localhost:7
 
 Without `GEMINI_API_KEY` the video feature still works through the manual timeline (Whisper and FFmpeg are local); automatic slide matching and all of answer evaluation need the key.
 
-## Choosing the model: Gemini or local Ollama
+## Choosing the model: Gemini, OpenRouter or local Ollama
 
-Both are supported (`LLM_PROVIDER` in `.env`):
+All three are supported (`LLM_PROVIDER` in `.env`):
 
 | Value | Behaviour |
 |---|---|
-| `gemini` (default) | Gemini free tier. Most accurate, small daily quota. |
-| `ollama` | Local model, no key, no quota, slower on CPU. Install Ollama, then `ollama pull qwen2.5vl:7b`. |
-| `auto` | Gemini first; if it is out of quota or down, falls back to Ollama. |
+| `gemini` (default) | Gemini free tier (`GEMINI_MODEL` is a fallback list). Most accurate, small daily quota. |
+| `openrouter` | Free vision models on OpenRouter (NVIDIA Nemotron VL, then Gemma). Free key, no card. |
+| `ollama` | Local model, no key, no quota. Install Ollama, then `ollama pull qwen2.5vl:7b`. |
+| `auto` | Gemini first; if it fails, OpenRouter (when `OPENROUTER_API_KEY` is set); last, Ollama. |
+
+A deployed server can reach a laptop's Ollama through a tunnel (`cloudflared tunnel --http-host-header localhost:11434 --url http://localhost:11434`, then set `OLLAMA_URL`). That fallback only works while the laptop is on.
 
 `GRADER_B_PROVIDER=ollama` makes the second grader a different model than the first. Local models are weaker at messy handwriting than Gemini, so expect more "needs review" flags.
 
@@ -54,12 +57,30 @@ cd frontend && pnpm typecheck && pnpm build
 
 `backend/tests` runs real FFmpeg and Whisper on `samples/`. Grading tests mock the model: they prove the rubric enforcement (clamping, invented criteria, evidence checks, review flags), not OCR quality.
 
+## Records, review and history
+
+Every evaluation and video job is a stored record, not a temporary job:
+
+- Evaluations keep the rubric, the student name, the answer sheet images, the transcript, both graders' marks, every flag and the time. A teacher can confirm or override any criterion with a reason; the AI mark is kept beside the teacher mark (audit trail) and totals use the teacher mark. Export one evaluation or all of them as CSV (cells that start like a formula are neutralised).
+- Video jobs keep the uploaded video, the deck, the slide images, the transcript, the timeline and the rendered MP4. Open, re-render, download or delete from the history list.
+- A job running when the server restarts is marked "interrupted" and can be retried from the stored inputs.
+- Work in progress (rubric text, student name, picked files) is kept when you switch tabs; text also survives a reload.
+
+Storage: `DATABASE_URL` (Postgres, e.g. Supabase) for records and `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` for files. Without them, SQLite and files go under `DATA_DIR` (default `./data`), which is fine locally but is wiped on every Render restart. Records are open to anyone with the site URL (no login), so do not upload real student data to a public deployment.
+
+### Supabase setup (free, no card)
+
+1. Create a project at https://supabase.com.
+2. Project Settings, Database, Connection string: copy the **Session pooler** URL (the direct host is IPv6-only and fails on Render). Put it in `DATABASE_URL` with your database password.
+3. Project Settings, API: copy the Project URL into `SUPABASE_URL` and the `service_role` key into `SUPABASE_SERVICE_KEY` (server only).
+4. Redeploy. The table and the private `edusync` bucket are created on start. `/api/health` then reports `"database":"postgres","storage":"supabase"`.
+
 ## Architecture
 
 ```
-React SPA ──/api──> FastAPI ── job store (in memory, 6h TTL)
+React SPA ──/api──> FastAPI ── store.py: Postgres/SQLite records + Supabase Storage/local files
                       ├─ heavy pool (1 worker): LibreOffice -> PyMuPDF PNGs, Whisper, FFmpeg
-                      └─ light pool (4):        Gemini calls (OCR, grading)
+                      └─ light pool (4):        model calls (OCR, grading): Gemini -> OpenRouter -> Ollama
 ```
 
 Video: slides to PNG, local Whisper transcript, Gemini picks the transcript sentence where each slide begins (so every cut lands on a sentence boundary, never mid-word), then `clean_timeline` enforces order, minimum dwell and valid slides. If confidence is low, slides are unmatched, speech is missing or there is no key, the editable timeline opens instead (with a draft that is labelled as unmatched). FFmpeg renders from the timeline: auto-detected key colour from the frame corners, `chromakey` + `despill` over white, `xfade` slide track, original audio mapped through (AAC), constant 30 fps.
@@ -74,20 +95,20 @@ Grading (two independent graders): Gemini transcribes the pages (equations as te
 
 | Host | Backend | FFmpeg | CPU / RAM | Long jobs | Verdict |
 |---|---|---|---|---|---|
-| Hugging Face Spaces (Docker, free) | yes | yes (apt) | 2 vCPU / 16 GB | no request timeout for polling jobs; ephemeral disk; sleeps after inactivity | **Best fit.** Account needed, no card. |
-| Render free | yes | via Docker | 0.1 CPU / 512 MB | spins down, too small for Whisper + render | No |
+| Hugging Face Spaces (Docker) | yes | yes (apt) | 2 vCPU / 16 GB | | Docker Spaces now need a paid plan for new accounts. |
+| Render free + Supabase | yes | via Docker | 0.1 CPU / 512 MB | sleeps after 15 min idle; slow for video, may run out of memory on long clips | **Used.** No card. Records in Supabase survive restarts. |
 | Fly.io, Railway | yes | yes | small | require a card | Not free without a card |
 | Vercel / Netlify | serverless only | no | 10 to 60 s limits | no | No (frontend only) |
 | Google Cloud Run | yes | yes | ok | free tier needs a billing account | Needs a card |
 
-Deploy to a Space: create a Docker Space, add `GEMINI_API_KEY` as a Space secret, push this repo (the front matter above configures it). Not deployed from this repo yet: that needs your account, so no live URL is claimed.
+Deployed on Render's free tier from this repository's Dockerfile. Configure Supabase (see above) so records and files survive Render restarts. Render free has a tenth of a CPU: handwriting grading is fine, video processing of long clips is slow and can run out of memory; keep demo clips short.
 
 ## Known limitations
 
 - Sample presenter video and handwriting are synthetic (TTS narrator, handwriting-style font). Real footage and real scans are not yet tested.
-- Slide matching and OCR/grading quality depend on Gemini and were not run against the live API in this build (no key available while building).
 - Chroma key suits an evenly lit green background; uneven lighting or green clothing will leak. Use the Green screen selector to force on or off.
-- Jobs and files live in memory and `/tmp`: restart or six hours clears them. Single render worker, so concurrent users queue.
+- Single render worker, so concurrent video users queue. Supabase free storage is about 1 GB with a 50 MB per-file limit (check your plan's current limits): a larger rendered video stays on the server disk only, and the job shows a warning saying so.
+- No login: anyone with the URL sees all records.
 - Gemini free tier has small daily quotas per model (an evaluation costs 3 calls, a video match 1). The client falls back across `GEMINI_MODEL`'s comma-separated list and gives a clear message when all are used up.
 - Gemini free tier has rate limits and may use inputs for model improvement. Do not upload real student data to a free key.
 - Slides that are only images have no text for matching; the speech still is used but accuracy drops.

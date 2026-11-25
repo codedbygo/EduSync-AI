@@ -3,12 +3,15 @@ import { useQuery } from "@tanstack/react-query"
 import { z } from "zod"
 import { request } from "@/lib/api"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { useDrafts } from "./drafts"
 
-const health = z.object({ llm_configured: z.boolean() })
+const health = z.object({ llm_configured: z.boolean(), storage: z.string().optional(), database: z.string().optional() })
 const tab = "rounded-t-lg px-4 py-2 text-sm font-semibold text-primary-foreground/80 hover:text-primary-foreground [&.active]:bg-background [&.active]:text-foreground"
 
 export function Layout() {
   const { data } = useQuery({ queryKey: ["health"], queryFn: () => request("/api/health", health) })
+  const lastVideo = useDrafts((s) => s.lastVideoJob)
+  const lastEval = useDrafts((s) => s.lastEvalJob)
   return (
     <div className="min-h-screen bg-muted/40">
       <header className="bg-primary text-primary-foreground">
@@ -18,8 +21,8 @@ export function Layout() {
             <span className="text-sm opacity-80">Lecture video + slides sync, rubric-based answer grading</span>
           </div>
           <nav className="mt-3 flex gap-1" aria-label="Features">
-            <Link to="/video" className={tab} activeProps={{ className: "active" }}>Video + Slides</Link>
-            <Link to="/eval" className={tab} activeProps={{ className: "active" }}>Answer Evaluation</Link>
+            <Link to="/video" search={{ job: lastVideo }} className={tab} activeProps={{ className: "active" }}>Video + Slides</Link>
+            <Link to="/eval" search={{ job: lastEval }} className={tab} activeProps={{ className: "active" }}>Answer Evaluation</Link>
           </nav>
         </div>
       </header>
@@ -27,11 +30,14 @@ export function Layout() {
         {data && !data.llm_configured && (
           <Alert>
             <AlertDescription>
-              GEMINI_API_KEY is not configured on this server. Answer evaluation is disabled and slide matching falls back to the manual timeline.
+              No AI model is configured on this server (Gemini, OpenRouter or Ollama). Answer evaluation is disabled and slide matching falls back to the manual timeline.
             </AlertDescription>
           </Alert>
         )}
         <Outlet />
+        {data?.storage === "local" && data.database === "sqlite" && (
+          <p className="text-xs text-muted-foreground">Records are stored on this server's disk. Configure DATABASE_URL and Supabase Storage to keep them across redeploys.</p>
+        )}
       </main>
     </div>
   )

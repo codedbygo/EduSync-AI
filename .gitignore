@@ -5,3 +5,6 @@ dist/
 __pycache__/
 .pytest_cache/
 samples/Caveat.ttf
+
+# local records and files (SQLite + blobs)
+data/

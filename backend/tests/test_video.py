@@ -42,8 +42,11 @@ def client(tmp_path_factory, monkeypatch_module=None):
     for k in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
         os.environ.pop(k, None)
     os.environ["LLM_PROVIDER"] = "gemini"
+    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
     main.DATA = Path(os.environ["DATA_DIR"])
-    return TestClient(main.app)
+    with TestClient(main.app) as c:  # runs the lifespan: store.init
+        yield c
 
 
 def wait(c, jid, until):
@@ -73,6 +76,19 @@ def test_end_to_end_manual_timeline_renders_valid_mp4(client):
     assert kinds == {"video", "audio"}
     dur = video.probe_duration(p)
     assert abs(dur - video.probe_duration(S / "presenter_greenscreen.mp4")) < 0.2    # audio/video length preserved
+
+    # restart: memory and working files gone; the record, result and slides come back from the store
+    import shutil
+    main.jobs.clear()
+    shutil.rmtree(main.DATA / jid)
+    s = client.get(f"/api/video/jobs/{jid}").json()
+    assert s["stage"] == "done" and s["timeline"][1]["start"] == 11.36
+    assert client.get(f"/api/video/jobs/{jid}/result.mp4").status_code == 200
+    assert client.get(f"/api/video/jobs/{jid}/slides/2").status_code == 200
+    assert any(i["id"] == jid and i["has_result"] for i in client.get("/api/video/jobs").json()["items"])
+    # re-render after the restart: inputs are fetched back from the store
+    assert client.post(f"/api/video/jobs/{jid}/render", json={"timeline": tl[:2]}).status_code == 200
+    assert wait(client, jid, {"done"})["result"]["slides_used"] == 2
 
 
 def test_bad_inputs_give_clear_errors(client):

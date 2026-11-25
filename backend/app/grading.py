@@ -3,6 +3,7 @@
 The LLM proposes marks; `validate()` is the authority. The rubric is the only source of
 truth: criteria the model invents are dropped, missing ones score 0, marks are clamped.
 """
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -150,6 +151,30 @@ def validate(rubric_qs: list[dict], raw: dict, transcript: str, page_confidence:
         "ocr_confidence": round(page_confidence, 2),
         "second_opinion": raw_b is not None,
     }
+
+
+def apply_overrides(result: dict, overrides: dict) -> dict:
+    """Teacher review on top of the AI result. The AI marks stay as they were (audit trail); final_* is what counts.
+
+    overrides = {question_id: {criterion_id: {"marks": float, "note": str, "at": iso}}}. Pure function.
+    """
+    r = json.loads(json.dumps(result))
+    total, open_reviews = 0.0, 0
+    for q in r["questions"]:
+        q_final = 0.0
+        for c in q["criteria"]:
+            o = overrides.get(q["question_id"], {}).get(c["criterion_id"])
+            c["teacher_marks"] = o["marks"] if o else None
+            c["teacher_note"] = o["note"] if o else ""
+            c["reviewed_at"] = o["at"] if o else None
+            c["final_marks"] = min(max(o["marks"], 0.0), c["max_marks"]) if o else c["marks_awarded"]
+            open_reviews += 1 if c["needs_review"] and not o else 0
+            q_final += c["final_marks"]
+        q["final_score"] = round(q_final, 2)
+        total += q_final
+    r["final_total"] = round(total, 2)
+    r["open_reviews"] = open_reviews
+    return r
 
 
 OCR_PROMPT = """You are transcribing handwritten student answer sheets. Images are pages in order.

@@ -82,7 +82,7 @@ export function TimelineEditor({ job }: { job: VideoJob }) {
         <Card>
           <CardHeader><CardTitle className="text-lg">Your synced video</CardTitle></CardHeader>
           <CardContent className="space-y-3">
-            <video src={`${url}?v=${job.result.duration}-${rows.map((r) => r.start).join()}`} controls preload="metadata" className="w-full rounded-lg bg-black" />
+            <video src={`${url}?v=${job.result.duration}-${rows.map((r) => r.start).join()}#t=0.1`} controls preload="metadata" className="w-full rounded-lg bg-black" />
             <div className="flex flex-wrap items-center gap-3">
               <a className={buttonVariants()} href={`${url}?download=true`}>Download MP4</a>
               <span className="text-sm text-muted-foreground">

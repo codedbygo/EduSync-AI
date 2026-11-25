@@ -16,6 +16,11 @@ export const videoJob = z.object({
   progress: z.number(),
   message: z.string(),
   error: z.string().nullable(),
+  title: z.string().optional(),
+  video_name: z.string().optional(),
+  deck_name: z.string().optional(),
+  created: z.number().optional(),
+  storage_warning: z.string().optional(),
   n_slides: z.number().optional(),
   slide_urls: z.array(z.string()),
   segments: z.array(segment).optional(),
@@ -29,3 +34,17 @@ export const videoJob = z.object({
 })
 export type VideoJob = z.infer<typeof videoJob>
 export const created = z.object({ id: z.string() })
+
+export const videoListItem = z.object({
+  id: z.string(),
+  title: z.string(),
+  stage: z.string(),
+  created_at: z.number(),
+  video_name: z.string().nullable().optional(),
+  deck_name: z.string().nullable().optional(),
+  n_slides: z.number().nullable().optional(),
+  duration: z.number().nullable().optional(),
+  has_result: z.boolean().nullable().optional(),
+  error: z.string().nullable().optional(),
+})
+export const videoList = z.object({ items: z.array(videoListItem), total: z.number() })
