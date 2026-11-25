@@ -6,6 +6,8 @@ import { createJSONStorage, persist } from "zustand/middleware"
  * so they survive switching tabs but not a page reload. Server data never goes here (it lives in the query cache). */
 type Drafts = {
   rubric: string
+  rubricText: string
+  rubricMode: "text" | "json"
   student: string
   title: string
   pages: File[]
@@ -31,6 +33,8 @@ export const useDrafts = create<Drafts>()(
   persist(
     (set, get) => ({
       rubric: "",
+      rubricText: "",
+      rubricMode: "text",
       student: "",
       title: "",
       pages: [],
@@ -45,7 +49,7 @@ export const useDrafts = create<Drafts>()(
     {
       name: "edusync-drafts",
       storage: safeStorage,
-      partialize: (s) => ({ rubric: s.rubric, student: s.student, title: s.title, autoRender: s.autoRender, lastEvalJob: s.lastEvalJob, lastVideoJob: s.lastVideoJob }),
+      partialize: (s) => ({ rubric: s.rubric, rubricText: s.rubricText, rubricMode: s.rubricMode, student: s.student, title: s.title, autoRender: s.autoRender, lastEvalJob: s.lastEvalJob, lastVideoJob: s.lastVideoJob }),
     },
   ),
 )

@@ -61,6 +61,7 @@ cd frontend && pnpm typecheck && pnpm build
 
 Every evaluation and video job is a stored record, not a temporary job:
 
+- Teachers write the rubric as plain text (no JSON needed): `Q1: question` lines, then marking points as `- point [marks]`, optional `Title:` and `Model answer:` lines. It is converted by fixed rules, not by AI, and a live preview shows exactly how it will be graded (marks per point, totals, and line-by-line problems) before anything runs. JSON is still accepted as an advanced option.
 - Evaluations keep the rubric, the student name, the answer sheet images, the transcript, both graders' marks, every flag and the time. A teacher can confirm or override any criterion with a reason; the AI mark is kept beside the teacher mark (audit trail) and totals use the teacher mark. Export one evaluation or all of them as CSV (cells that start like a formula are neutralised).
 - Video jobs keep the uploaded video, the deck, the slide images, the transcript, the timeline and the rendered MP4. Open, re-render, download or delete from the history list.
 - A job running when the server restarts is marked "interrupted" and can be retried from the stored inputs.

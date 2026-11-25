@@ -3,10 +3,10 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
 import { ErrorNote, StatusCard, WarnNote } from "@/components/StatusCard"
 import { useDrafts } from "@/app/drafts"
-import { useCreateEvalJob, useEvalJob, useRetryEval, useSampleRubric } from "../hooks"
+import { useCreateEvalJob, useEvalJob, useRetryEval } from "../hooks"
+import { currentRubric, RubricEditor } from "./RubricEditor"
 import { EvalResultView } from "./EvalResultView"
 import { EvalHistory } from "./EvalHistory"
 
@@ -15,7 +15,6 @@ export function EvalPage() {
   const navigate = useNavigate({ from: "/eval" })
   const d = useDrafts()
   const create = useCreateEvalJob()
-  const sample = useSampleRubric()
   const retry = useRetryEval()
   const q = useEvalJob(job)
   const s = q.data
@@ -24,10 +23,11 @@ export function EvalPage() {
     d.set({ lastEvalJob: id })
     return navigate({ search: { job: id } })
   }
-  const loadFile = async (f?: File) => f && d.set({ rubric: await f.text() })
+  const parsed = currentRubric(d.rubricMode, d.rubricText, d.rubric)
   const submit = () =>
+    parsed.rubric &&
     create.mutate(
-      { rubric: d.rubric, pages: d.pages, student: d.student, title: d.title },
+      { rubric: JSON.stringify(parsed.rubric), pages: d.pages, student: d.student, title: d.title },
       {
         onSuccess: (r) => {
           d.setPages([]) // the rubric stays for the next student; the sheet and name are per student
@@ -48,17 +48,7 @@ export function EvalPage() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="rub">Questions and marking rubric (JSON)</Label>
-              <Textarea id="rub" spellCheck={false} className="min-h-56 font-mono text-xs" value={d.rubric} onChange={(e) => d.set({ rubric: e.target.value })} />
-              <div className="flex flex-wrap items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => sample.mutate(undefined, { onSuccess: (r) => d.set({ rubric: JSON.stringify(r, null, 2) }) })}>
-                  Load sample rubric
-                </Button>
-                <input aria-label="Upload rubric JSON file" type="file" accept=".json" className="text-sm" onChange={(e) => loadFile(e.target.files?.[0])} />
-              </div>
-              {sample.error && <ErrorNote message={sample.error.message} />}
-            </div>
+            <RubricEditor parsed={parsed} />
             <div className="space-y-3">
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-1">
@@ -83,7 +73,7 @@ export function EvalPage() {
               </div>
             </div>
           </div>
-          <Button onClick={submit} disabled={!d.rubric.trim() || d.pages.length === 0 || d.pages.length > 12 || create.isPending}>
+          <Button onClick={submit} disabled={!parsed.rubric || d.pages.length === 0 || d.pages.length > 12 || create.isPending}>
             {create.isPending ? "Uploading..." : "Evaluate"}
           </Button>
           {create.error && <ErrorNote message={create.error.message} />}
