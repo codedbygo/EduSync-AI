@@ -179,3 +179,29 @@ def test_restart_only_interrupts_this_servers_jobs(env):
     with TestClient(main.app) as c:
         assert c.get(f"/api/eval/jobs/{mine}").json()["stage"] == "interrupted"
         assert c.get(f"/api/eval/jobs/{theirs}").json()["stage"] == "running"
+
+
+def test_rubric_file_text_reads_word_pdf_and_text():
+    import io
+    import zipfile
+
+    import fitz
+    import pytest
+    from fastapi import HTTPException
+
+    from app.main import rubric_file_text
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("word/document.xml", '<w:document><w:body><w:p><w:r><w:t>Q1: Why?</w:t></w:r></w:p>'
+                   '<w:p><w:r><w:t xml:space="preserve">- Gives a reason </w:t></w:r><w:r><w:t>[1] &amp; more</w:t></w:r></w:p></w:body></w:document>')
+    assert rubric_file_text("r.docx", buf.getvalue()) == "Q1: Why?\n- Gives a reason [1] & more"
+
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "Q1: Why?")
+    assert "Q1: Why?" in rubric_file_text("r.pdf", doc.tobytes())
+
+    assert rubric_file_text("r.md", "﻿Q1: Hi".encode()) == "Q1: Hi"
+    for name, data in [("r.png", b"x"), ("r.bin", b"\xff\xfe\x00\x81")]:
+        with pytest.raises(HTTPException):
+            rubric_file_text(name, data)

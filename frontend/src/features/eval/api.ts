@@ -15,6 +15,11 @@ export const createEvalJob = (v: NewEval) => {
 export const fetchEvalJob = (id: string) => request(`/api/eval/jobs/${id}`, evalJob)
 export const fetchEvalList = (limit: number) => request(`/api/eval/jobs?limit=${limit}`, evalList)
 export const fetchSampleRubric = () => request("/api/eval/sample-rubric", rubricSchema)
+export const fetchRubricFileText = (f: File) => {
+  const fd = new FormData()
+  fd.append("file", f)
+  return request("/api/eval/rubric-text", z.object({ text: z.string() }), { method: "POST", body: fd }).then((r) => r.text)
+}
 export const retryEvalJob = (id: string) => request(`/api/eval/jobs/${id}/retry`, created, { method: "POST" })
 export const deleteEvalJob = (id: string) => request(`/api/eval/jobs/${id}`, z.unknown(), { method: "DELETE" })
 

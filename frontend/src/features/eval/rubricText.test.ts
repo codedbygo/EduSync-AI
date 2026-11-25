@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { parseRubricText, rubricToText, RUBRIC_TEXT_EXAMPLE } from "./rubricText"
+import { parseRubricText, rubricToText, RUBRIC_SAMPLE_FILE, RUBRIC_TEXT_EXAMPLE } from "./rubricText"
 
 describe("parseRubricText", () => {
   it("reads the example a teacher would write", () => {
@@ -55,5 +55,13 @@ Q1: Again.`)
     const json = { title: "T", questions: [{ id: "Q1", text: "Why?", reference_answer: "Because.", criteria: [{ id: "a", description: "Gives a reason", marks: 1.5 }] }] }
     const back = parseRubricText(rubricToText(json)).rubric
     expect(back).toEqual({ title: "T", questions: [{ id: "Q1", text: "Why?", reference_answer: "Because.", criteria: [{ id: "c1", description: "Gives a reason", marks: 1.5 }] }] })
+  })
+})
+
+describe("RUBRIC_SAMPLE_FILE", () => {
+  it("uploads as it is: the instructions are ignored and the example parses", () => {
+    const p = parseRubricText(RUBRIC_SAMPLE_FILE)
+    expect(p.errors).toEqual([])
+    expect(p.total).toBe(7)
   })
 })

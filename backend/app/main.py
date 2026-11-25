@@ -532,6 +532,42 @@ def sample_rubric():
     return json.loads((Path(__file__).parent / "sample-rubric.json").read_text())
 
 
+def rubric_file_text(name: str, data: bytes) -> str:
+    """Text of an uploaded rubric file (Word, PDF, or any plain-text file); the page parses it with the same rules as typed text."""
+    ext = Path(name or "").suffix.lower()
+    if ext == ".pdf":
+        import fitz
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return "\n".join(p.get_text() for p in doc)
+    if ext == ".docx":
+        import re
+        import zipfile
+        from xml.sax.saxutils import unescape
+        try:
+            xml = zipfile.ZipFile(io.BytesIO(data)).read("word/document.xml").decode("utf-8")
+        except (zipfile.BadZipFile, KeyError):
+            raise HTTPException(400, "This Word file could not be opened. Save it again as .docx and retry.")
+        paras = re.findall(r"<w:p[ >].*?</w:p>", xml, re.S)
+        return "\n".join(unescape("".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", p))) for p in paras)
+    if ext in IMG_EXT or ext in {".doc", ".odt", ".rtf", ".pages"}:
+        raise HTTPException(415, f"{ext} rubrics are not supported. Upload a .docx, .pdf or .txt file, or paste the text.")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(415, "This file is not text. Upload a .docx, .pdf or .txt file, or paste the text.")
+
+
+@app.post("/api/eval/rubric-text")
+async def rubric_text(file: UploadFile = File(...)):
+    data = await file.read((5 << 20) + 1)
+    if len(data) > 5 << 20:
+        raise HTTPException(413, "A rubric file must be under 5 MB.")
+    text = rubric_file_text(file.filename or "", data).strip()
+    if not text:
+        raise HTTPException(400, "No text found in this file. A scanned PDF has no text; type or paste the rubric instead.")
+    return {"text": text}
+
+
 @app.exception_handler(HTTPException)
 async def http_err(_, exc: HTTPException):
     return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)

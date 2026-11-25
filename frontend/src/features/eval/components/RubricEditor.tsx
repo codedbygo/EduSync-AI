@@ -1,10 +1,12 @@
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { ErrorNote } from "@/components/StatusCard"
 import { useDrafts } from "@/app/drafts"
+import { useState } from "react"
+import { fetchRubricFileText } from "../api"
 import { useSampleRubric } from "../hooks"
-import { parseRubricText, rubricToText, RUBRIC_TEXT_EXAMPLE, type Parsed, type Rubric } from "../rubricText"
+import { parseRubricText, rubricToText, RUBRIC_SAMPLE_FILE, RUBRIC_TEXT_EXAMPLE, type Parsed, type Rubric } from "../rubricText"
 
 /** The rubric the form will submit, from whichever editor is active. Pure: computed during render. */
 export function currentRubric(mode: "text" | "json", text: string, json: string): Parsed {
@@ -26,16 +28,24 @@ export function RubricEditor({ parsed }: { parsed: Parsed }) {
   const d = useDrafts()
   const sample = useSampleRubric()
 
+  const [upload, setUpload] = useState<{ busy?: boolean; error?: string; name?: string }>({})
   const loadFile = async (f?: File) => {
     if (!f) return
-    const body = await f.text()
+    setUpload({ busy: true })
     try {
-      const json = JSON.parse(body) as Rubric // a JSON rubric file: show it as text too
-      d.set({ rubric: body, rubricText: rubricToText(json) })
-    } catch {
-      d.set({ rubricText: body, rubricMode: "text" })
+      if (f.name.toLowerCase().endsWith(".json")) {
+        const body = await f.text()
+        const json = JSON.parse(body) as Rubric // a JSON rubric file: show it as text too
+        d.set({ rubric: body, rubricText: rubricToText(json), rubricMode: "text" })
+      } else {
+        d.set({ rubricText: await fetchRubricFileText(f), rubricMode: "text" }) // Word, PDF, text: the server extracts the text
+      }
+      setUpload({ name: f.name })
+    } catch (e) {
+      setUpload({ error: e instanceof SyntaxError ? `Not valid JSON: ${e.message}` : (e as Error).message })
     }
   }
+  const sampleHref = `data:text/plain;charset=utf-8,${encodeURIComponent(RUBRIC_SAMPLE_FILE)}`
   const switchTo = (mode: "text" | "json") => {
     // carry the current rubric across so nothing typed is lost
     if (mode === "json" && parsed.rubric) d.set({ rubricMode: mode, rubric: JSON.stringify(parsed.rubric, null, 2) })
@@ -70,8 +80,17 @@ export function RubricEditor({ parsed }: { parsed: Parsed }) {
           onClick={() => sample.mutate(undefined, { onSuccess: (r) => d.set({ rubric: JSON.stringify(r, null, 2), rubricText: rubricToText(r) }) })}>
           Load sample rubric
         </Button>
-        <input aria-label="Upload rubric file (text or JSON)" type="file" accept=".txt,.json,text/plain,application/json" className="text-sm" onChange={(e) => loadFile(e.target.files?.[0])} />
+        <a href={sampleHref} download="rubric-sample.txt" className={buttonVariants({ variant: "outline", size: "sm" })}>Download sample rubric file</a>
       </div>
+      <div className="space-y-1">
+        <Label htmlFor="rubfile">Or upload a rubric file (Word .docx, PDF, .txt or .json), written like the sample</Label>
+        <input id="rubfile" type="file" className="block w-full rounded-lg border bg-background p-2 text-sm"
+          onChange={(e) => { void loadFile(e.target.files?.[0]); e.target.value = "" }} />
+        <p role="status" className="text-xs text-muted-foreground">
+          {upload.busy ? "Reading the file..." : upload.name ? `Loaded ${upload.name}. Check the preview below and fix any line it points to.` : ""}
+        </p>
+      </div>
+      {upload.error && <ErrorNote message={upload.error} />}
       {sample.error && <ErrorNote message={sample.error.message} />}
 
       <RubricPreview parsed={parsed} />

@@ -115,6 +115,22 @@ export function rubricToText(r: LooseRubric): string {
   return out.join("\n").trim() + "\n"
 }
 
+/** The downloadable sample: the instructions are "#" lines, which the parser ignores, so the file uploads as it is. */
+const SAMPLE_HEADER = `# EduSync AI rubric file. Write your rubric like the example below, save it, and upload it.
+# Accepted files: Word (.docx), PDF with text (not a scan), or plain text (.txt).
+#
+# Rules:
+#   Title: <name>                    optional, first line
+#   Q1: <question text>              one line per question (also "1." or "Question 1)")
+#   - <marking point> [2]            one line per marking point, ending with its marks
+#                                    ("(2 marks)" or "- 2 marks" also work)
+#   Model answer: <answer>           optional, under its question
+#   Lines starting with # are ignored. Empty lines are fine.
+#
+# Marks are given only for the marking points. The total is the sum of all [marks].
+
+`
+
 export const RUBRIC_TEXT_EXAMPLE = `Title: Photosynthesis quiz
 
 Q1: Explain how photosynthesis converts light into chemical energy. (4 marks)
@@ -128,3 +144,5 @@ Q2: A car travels 150 km in 2.5 hours. Find its average speed. (3 marks)
 - Substitutes 150 and 2.5 [1]
 - Gets 60 km/h with the unit [1]
 Model answer: 150 / 2.5 = 60 km/h`
+
+export const RUBRIC_SAMPLE_FILE = SAMPLE_HEADER + RUBRIC_TEXT_EXAMPLE + "\n"
