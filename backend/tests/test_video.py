@@ -42,7 +42,7 @@ def client(tmp_path_factory, monkeypatch_module=None):
     for k in ("GEMINI_API_KEY", "OPENROUTER_API_KEY"):
         os.environ.pop(k, None)
     os.environ["LLM_PROVIDER"] = "gemini"
-    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
+    for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "BLOB_STORE"):
         os.environ.pop(k, None)
     main.DATA = Path(os.environ["DATA_DIR"])
     with TestClient(main.app) as c:  # runs the lifespan: store.init

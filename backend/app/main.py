@@ -147,6 +147,8 @@ def serve(local: Path, key: str | None, media_type: str, download: str | None = 
             return FileResponse(p, media_type=media_type, filename=download)
         if (u := store.blobs.signed_url(key, download)) is not None:
             return RedirectResponse(u, status_code=307)
+        if store.blobs.fetch(key, local):  # database store: bring it back into the working cache, then serve with range support
+            return FileResponse(local, media_type=media_type, filename=download)
     raise HTTPException(404, "File not available.")
 
 
@@ -195,7 +197,7 @@ def page_list(limit: int, offset: int, kind: str) -> dict:
 @app.get("/api/health")
 def health():
     return {"ok": True, "llm_configured": llm.available(), "model": llm._model(), "provider": llm.default_provider(),
-            "storage": "supabase" if store.blobs.remote else "local",
+            "storage": {"supabase": "supabase", "db": "database", "local": "local"}[store.blobs.mode],
             "database": "postgres" if store._eng().dialect.name == "postgresql" else "sqlite"}
 
 

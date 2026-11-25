@@ -36,7 +36,7 @@ export function Layout() {
         )}
         <Outlet />
         {data?.storage === "local" && data.database === "sqlite" && (
-          <p className="text-xs text-muted-foreground">Records are stored on this server's disk. Configure DATABASE_URL and Supabase Storage to keep them across redeploys.</p>
+          <p className="text-xs text-muted-foreground">Records are stored on this server's disk. Set DATABASE_URL (Neon) to keep them across redeploys.</p>
         )}
       </main>
     </div>

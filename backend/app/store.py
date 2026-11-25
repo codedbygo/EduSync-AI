@@ -1,7 +1,8 @@
 """Durable storage: one table of job records and a blob store for files.
 
-DATABASE_URL set (e.g. Supabase Postgres, session pooler URL) -> Postgres; unset -> SQLite under DATA_DIR.
-SUPABASE_URL + SUPABASE_SERVICE_KEY set -> files in Supabase Storage; unset -> files under DATA_DIR/blobs.
+DATABASE_URL set (e.g. Neon or Supabase Postgres) -> Postgres; unset -> SQLite under DATA_DIR.
+Files: SUPABASE_URL + SUPABASE_SERVICE_KEY -> Supabase Storage; else with a Postgres DATABASE_URL -> a table in that
+database (Neon has no file store); else DATA_DIR/blobs. BLOB_STORE=local|db|supabase forces one.
 The server disk is only a working cache: anything a user must get back later is written here.
 """
 import json
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 
 import httpx
-from sqlalchemy import Column, Float, MetaData, String, Table, Text, create_engine, delete, func, insert, select, update
+from sqlalchemy import Column, Float, LargeBinary, MetaData, String, Table, Text, create_engine, delete, func, insert, select, update
 
 TERMINAL = {"done", "review", "error", "interrupted"}  # a job in any other stage is running
 
@@ -26,6 +27,13 @@ records = Table(
     Column("updated_at", Float, nullable=False),
     Column("summary", Text, nullable=False, default="{}"),  # small JSON for history lists
     Column("data", Text, nullable=False),                   # the full job record as JSON
+)
+
+files_table = Table(
+    "edusync_files", meta,
+    Column("key", String(300), primary_key=True),
+    Column("content_type", String(100), nullable=False),
+    Column("data", LargeBinary, nullable=False),
 )
 
 _engine = None
@@ -97,29 +105,51 @@ def running_ids() -> list[str]:
 
 # ---------------- blobs ----------------
 class _Blobs:
-    """Local folder or Supabase Storage (REST). Keys look like 'video/<id>/result.mp4'."""
+    """Local folder, a database table, or Supabase Storage (REST). Keys look like 'video/<id>/result.mp4'."""
 
     def init(self, data_dir: Path) -> None:
         self.url = os.getenv("SUPABASE_URL", "").rstrip("/")
-        self.key = os.getenv("SUPABASE_SERVICE_KEY", "")
+        self.key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SECRET_KEY", "")  # either name: Supabase now calls it the secret key
         self.bucket = os.getenv("SUPABASE_BUCKET", "edusync")
         self.local = data_dir / "blobs"
-        if self.remote:
+        self.max_bytes = int(os.getenv("BLOB_MAX_MB", "50")) << 20  # per file; Neon free is ~0.5 GB in total
+        forced = os.getenv("BLOB_STORE", "").lower()
+        if forced in ("local", "db", "supabase"):
+            self.mode = forced
+        elif self.url and self.key:
+            self.mode = "supabase"
+        else:
+            self.mode = "db" if _engine is not None and _engine.dialect.name == "postgresql" else "local"
+        if self.mode == "supabase":
             r = httpx.post(f"{self.url}/storage/v1/bucket", headers=self._h(), timeout=30,
                            json={"id": self.bucket, "name": self.bucket, "public": False})
             if r.status_code not in (200, 201, 400, 409) or (r.status_code == 400 and "exist" not in r.text.lower()):
                 raise RuntimeError(f"Supabase Storage: cannot create bucket '{self.bucket}': HTTP {r.status_code} {r.text[:200]}")
-        else:
+        elif self.mode == "local":
             self.local.mkdir(parents=True, exist_ok=True)
 
     @property
     def remote(self) -> bool:
-        return bool(self.url and self.key)
+        return self.mode == "supabase"
 
     def _h(self) -> dict:
-        return {"Authorization": f"Bearer {self.key}", "apikey": self.key}
+        if self.key.startswith("sb_"):  # new-style secret key: not a JWT, so it goes in the apikey header only
+            return {"apikey": self.key}
+        return {"Authorization": f"Bearer {self.key}", "apikey": self.key}  # legacy service_role JWT
 
     def put(self, key: str, src: Path, content_type: str = "application/octet-stream") -> None:
+        size = src.stat().st_size
+        if self.mode != "local" and size > self.max_bytes:
+            raise StorageError(f"Could not store {key.rsplit('/', 1)[-1]}: {size >> 20} MB is over the {self.max_bytes >> 20} MB per-file limit")
+        if self.mode == "db":
+            row = {"content_type": content_type, "data": src.read_bytes()}
+            try:
+                with _eng().begin() as c:
+                    if c.execute(update(files_table).where(files_table.c.key == key).values(**row)).rowcount == 0:
+                        c.execute(insert(files_table).values(key=key, **row))
+            except Exception as e:  # e.g. the database is full
+                raise StorageError(f"Could not store {key.rsplit('/', 1)[-1]} in the database: {type(e).__name__}")
+            return
         if not self.remote:
             dst = self.local / key
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +164,13 @@ class _Blobs:
     def fetch(self, key: str, dst: Path) -> bool:
         """Copy the blob to dst. False if it does not exist."""
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if self.mode == "db":
+            with _eng().connect() as c:
+                r = c.execute(select(files_table.c.data).where(files_table.c.key == key)).first()
+            if r is None:
+                return False
+            dst.write_bytes(r[0])
+            return True
         if not self.remote:
             p = self.local / key
             if not p.exists():
@@ -150,7 +187,7 @@ class _Blobs:
 
     def local_path(self, key: str) -> Path | None:
         p = self.local / key
-        return p if not self.remote and p.exists() else None
+        return p if self.mode == "local" and p.exists() else None
 
     def signed_url(self, key: str, download_name: str | None = None) -> str | None:
         if not self.remote:
@@ -163,6 +200,10 @@ class _Blobs:
 
     def delete(self, keys: list[str]) -> None:
         if not keys:
+            return
+        if self.mode == "db":
+            with _eng().begin() as c:
+                c.execute(delete(files_table).where(files_table.c.key.in_(keys)))
             return
         if not self.remote:
             for k in keys:

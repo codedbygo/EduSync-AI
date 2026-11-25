@@ -19,10 +19,11 @@ AI = {"total_score": 4.0, "max_total": 5.0, "needs_review": True, "ocr_confidenc
                                    "evidence_verified": False, "confidence": 0.4, "needs_review": True, "flags": ["x"]}]}]}
 
 
-@pytest.fixture
-def env(tmp_path, monkeypatch):
+@pytest.fixture(params=["local", "db"])  # files in a folder, or inside the database (the Neon setup)
+def env(tmp_path, monkeypatch, request):
     for k in ("DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("BLOB_STORE", request.param)
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "test")
     monkeypatch.setattr(main, "DATA", tmp_path)
@@ -109,6 +110,23 @@ def test_running_job_cannot_be_deleted_and_bad_input_is_rejected(env, monkeypatc
         assert c.get("/api/eval/jobs?limit=0").status_code == 422
         assert c.post("/api/video/jobs/doesnotexist/render", json={"timeline": [{"slide": 1, "start": 0}]}).status_code == 404
         assert c.get("/api/health").json()["database"] == "sqlite"
+
+
+def test_database_file_store_round_trip_and_size_cap(tmp_path, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("BLOB_STORE", "db")
+    monkeypatch.setenv("BLOB_MAX_MB", "1")
+    store.init(tmp_path)
+    small, big = tmp_path / "a.png", tmp_path / "b.mp4"
+    small.write_bytes(b"\x89PNG" * 100)
+    big.write_bytes(b"0" * (2 << 20))
+    store.blobs.put("eval/x/a.png", small, "image/png")
+    store.blobs.put("eval/x/a.png", small, "image/png")  # upsert, not a duplicate-key error
+    assert store.blobs.fetch("eval/x/a.png", tmp_path / "out.png") and (tmp_path / "out.png").read_bytes() == small.read_bytes()
+    with pytest.raises(store.StorageError, match="per-file limit"):
+        store.blobs.put("video/x/result.mp4", big, "video/mp4")
+    store.blobs.delete(["eval/x/a.png"])
+    assert not store.blobs.fetch("eval/x/a.png", tmp_path / "gone.png")
 
 
 def test_supabase_storage_requests(monkeypatch, tmp_path):

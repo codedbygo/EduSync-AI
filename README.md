@@ -66,19 +66,20 @@ Every evaluation and video job is a stored record, not a temporary job:
 - A job running when the server restarts is marked "interrupted" and can be retried from the stored inputs.
 - Work in progress (rubric text, student name, picked files) is kept when you switch tabs; text also survives a reload.
 
-Storage: `DATABASE_URL` (Postgres, e.g. Supabase) for records and `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` for files. Without them, SQLite and files go under `DATA_DIR` (default `./data`), which is fine locally but is wiped on every Render restart. Records are open to anyone with the site URL (no login), so do not upload real student data to a public deployment.
+Storage: set `DATABASE_URL` to a Postgres database (Neon) and both records and files (answer sheet images, slides, rendered videos) are kept there. Without it, SQLite and files go under `DATA_DIR` (default `./data`): fine locally, wiped on every Render restart. Supabase Storage (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`) can hold the files instead. Records are open to anyone with the site URL (no login), so do not upload real student data to a public deployment.
 
-### Supabase setup (free, no card)
+### Neon setup (free, no card)
 
-1. Create a project at https://supabase.com.
-2. Project Settings, Database, Connection string: copy the **Session pooler** URL (the direct host is IPv6-only and fails on Render). Put it in `DATABASE_URL` with your database password.
-3. Project Settings, API: copy the Project URL into `SUPABASE_URL` and the `service_role` key into `SUPABASE_SERVICE_KEY` (server only).
-4. Redeploy. The table and the private `edusync` bucket are created on start. `/api/health` then reports `"database":"postgres","storage":"supabase"`.
+1. Sign up at https://neon.tech and create a project (pick the region closest to your Render service).
+2. Click **Connect** and copy the connection string (`postgresql://...neon.tech/neondb?sslmode=require...`).
+3. Set it as `DATABASE_URL` in Render (and in `.env` for local use), then redeploy. Tables are created on start. `/api/health` then reports `"database":"postgres","storage":"database"`.
+
+Neon's free plan has about 0.5 GB of storage. Each stored file is capped at `BLOB_MAX_MB` (default 50); delete old videos from the history list to free space.
 
 ## Architecture
 
 ```
-React SPA ──/api──> FastAPI ── store.py: Postgres/SQLite records + Supabase Storage/local files
+React SPA ──/api──> FastAPI ── store.py: records + files in Postgres (Neon) or SQLite + local folder
                       ├─ heavy pool (1 worker): LibreOffice -> PyMuPDF PNGs, Whisper, FFmpeg
                       └─ light pool (4):        model calls (OCR, grading): Gemini -> OpenRouter -> Ollama
 ```
@@ -96,18 +97,18 @@ Grading (two independent graders): Gemini transcribes the pages (equations as te
 | Host | Backend | FFmpeg | CPU / RAM | Long jobs | Verdict |
 |---|---|---|---|---|---|
 | Hugging Face Spaces (Docker) | yes | yes (apt) | 2 vCPU / 16 GB | | Docker Spaces now need a paid plan for new accounts. |
-| Render free + Supabase | yes | via Docker | 0.1 CPU / 512 MB | sleeps after 15 min idle; slow for video, may run out of memory on long clips | **Used.** No card. Records in Supabase survive restarts. |
+| Render free + Neon | yes | via Docker | 0.1 CPU / 512 MB | sleeps after 15 min idle; slow for video, may run out of memory on long clips | **Used.** No card. Records and files in Neon survive restarts. |
 | Fly.io, Railway | yes | yes | small | require a card | Not free without a card |
 | Vercel / Netlify | serverless only | no | 10 to 60 s limits | no | No (frontend only) |
 | Google Cloud Run | yes | yes | ok | free tier needs a billing account | Needs a card |
 
-Deployed on Render's free tier from this repository's Dockerfile. Configure Supabase (see above) so records and files survive Render restarts. Render free has a tenth of a CPU: handwriting grading is fine, video processing of long clips is slow and can run out of memory; keep demo clips short.
+Deployed on Render's free tier from this repository's Dockerfile. Configure Neon (see above) so records and files survive Render restarts. Render free has a tenth of a CPU: handwriting grading is fine, video processing of long clips is slow and can run out of memory; keep demo clips short.
 
 ## Known limitations
 
 - Sample presenter video and handwriting are synthetic (TTS narrator, handwriting-style font). Real footage and real scans are not yet tested.
 - Chroma key suits an evenly lit green background; uneven lighting or green clothing will leak. Use the Green screen selector to force on or off.
-- Single render worker, so concurrent video users queue. Supabase free storage is about 1 GB with a 50 MB per-file limit (check your plan's current limits): a larger rendered video stays on the server disk only, and the job shows a warning saying so.
+- Single render worker, so concurrent video users queue. Neon free storage is about 0.5 GB (check your plan's current limits), and files over `BLOB_MAX_MB` stay on the server disk only, with a warning on the job.
 - No login: anyone with the URL sees all records.
 - Gemini free tier has small daily quotas per model (an evaluation costs 3 calls, a video match 1). The client falls back across `GEMINI_MODEL`'s comma-separated list and gives a clear message when all are used up.
 - Gemini free tier has rate limits and may use inputs for model improvement. Do not upload real student data to a free key.
