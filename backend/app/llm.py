@@ -92,9 +92,9 @@ def _call(model: str, body: dict, key: str, retries: int) -> dict:
             time.sleep(2 ** attempt)
             continue
         if (r.status_code == 429 and "PerDay" in r.text) or r.status_code == 404:  # quota used up or model retired
-            raise _DailyQuota(model)
+            raise _DailyQuota(f"{model}: HTTP {r.status_code} {r.text[:160]}")
         if r.status_code in (500, 503) and attempt >= 1:
-            raise _DailyQuota(model)  # overloaded: move on to the next model instead of waiting
+            raise _DailyQuota(f"{model}: HTTP {r.status_code}")  # overloaded: move on to the next model instead of waiting
         if r.status_code in (429, 500, 503):
             last = f"HTTP {r.status_code} (rate limit or overload)"
             time.sleep(min(60, 15 * (attempt + 1)))  # free tier: per-minute quota resets within a minute
