@@ -198,7 +198,8 @@ def match(slide_texts: list[str], segments: list[dict], duration: float) -> dict
     if not llm.available():
         return {"timeline": even_draft(n, duration), "weak": True, "note": "GEMINI_API_KEY is not set, so automatic matching is off. The timeline below is an even-split draft; edit it, then render."}
     try:
-        raw = llm.generate_json(build_match_prompt(slide_texts, segments)).get("timeline", [])
+        res = llm.generate_json(build_match_prompt(slide_texts, segments))
+        raw = res.get("timeline") or res.get("items") or []
     except llm.LLMError as e:
         return {"timeline": even_draft(n, duration), "weak": True, "note": f"Automatic matching failed ({e}). Edit the timeline below."}
     tl = clean_timeline(segments_to_times(raw, segments), n, duration)
@@ -231,11 +232,9 @@ def detect_background(video: Path, tmp: Path) -> tuple[str | None, str | None]:
     spread = max(min(abs(x - med_h), 360 - abs(x - med_h)) for x in hues)  # lighting changes brightness, not hue
     if sat < 0.3 or spread > 25:
         return None, None
+    # The measured colour itself: render keys by RGB distance (colorkey), so dark clothing and skin, far from
+    # the backdrop in RGB, stay solid even when the backdrop is a yellow-green with little chroma.
     r, g, b = (int(statistics.median(p[i] for p in px)) for i in range(3))
-    # FFmpeg's chromakey compares chroma strength, which shrinks with brightness: a dark backdrop colour would
-    # sit next to black clothing and key it out too. Brighten the key (same hue and saturation) to a fixed level.
-    f = 160 / max(r, g, b, 1)
-    r, g, b = (min(255, round(c * f)) for c in (r, g, b))
     despill = "green" if 70 <= med_h < 190 else "blue" if 190 <= med_h < 270 else None
     return f"0x{r:02x}{g:02x}{b:02x}", despill
 
@@ -331,8 +330,9 @@ def render(video: Path, slide_imgs: list[Path], timeline: list[dict], out: Path,
     # centre-crop the presenter to the window's aspect, then (optionally) remove the background
     crop = f"crop='min(iw,ih*{pw}/{ph})':'min(ih,iw*{ph}/{pw})',scale={pw}:{ph}"
     if key:
-        ds = f",despill=type={despill}:mix=0.6:expand=0.2" if despill else ""
-        fc.append(f"[pa]{crop},chromakey={key}:0.12:0.06{ds},format=yuva420p[pres]")
+        ds = f",despill=type={despill}:mix=0.3:expand=0" if despill else ""
+        # ponytail: one global RGB distance; a backdrop lit very unevenly may need a per-video similarity knob
+        fc.append(f"[pa]{crop},format=rgba,colorkey={key}:0.12:0.02{ds},format=yuva420p[pres]")
     else:
         fc.append(f"[pa]{crop},format=yuv420p[pres]")
     fc.append(f"color=c=white:s={pw}x{ph}:r={FPS}:d={duration:.3f}[box]")

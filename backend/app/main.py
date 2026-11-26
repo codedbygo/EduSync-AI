@@ -136,7 +136,7 @@ def keep(jid: str, key: str, path: Path, ctype: str) -> str | None:
         store.blobs.put(key, path, ctype)
         return key
     except store.StorageError as e:
-        update(jid, storage_warning=f"{e}. This file is only on the server disk and will be lost on restart.")
+        update(jid, storage_warning=f"{e} of the free cloud storage, so it is kept on the server's own disk instead. It still plays and downloads normally.")
         return None
 
 

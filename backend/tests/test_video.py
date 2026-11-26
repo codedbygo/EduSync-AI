@@ -187,3 +187,13 @@ def test_hosted_transcription_request_and_fallback(monkeypatch):
     monkeypatch.setattr(httpx, "post", down)
     monkeypatch.setattr(video, "_local_transcribe", lambda v: [{"start": 1.0, "end": 2.0, "text": "local"}])
     assert video.transcribe(S / "presenter_greenscreen.mp4")[0]["text"] == "local"   # hosted failure never fails the job
+
+
+def test_match_accepts_a_bare_list_from_the_model(monkeypatch):
+    from app import llm
+    segs = [{"start": 0.0, "end": 5.0, "text": "a"}, {"start": 10.0, "end": 15.0, "text": "b"}]
+    monkeypatch.setattr(llm, "available", lambda: True)
+    answer = json.dumps([{"slide": 1, "segment": 0, "confidence": 0.9}, {"slide": 2, "segment": 1, "confidence": 0.9}])
+    monkeypatch.setattr(llm, "generate_json", lambda *a, **k: llm.parse_json(answer))
+    r = video.match(["one", "two"], segs, 30.0)
+    assert [t["slide"] for t in r["timeline"]] == [1, 2] and not r["weak"]
