@@ -56,6 +56,13 @@ def init(data_dir: Path) -> None:
     kw: dict = {"pool_pre_ping": True}
     if url.startswith("sqlite"):
         kw["connect_args"] = {"check_same_thread": False}  # worker threads share the engine
+    else:
+        # A pooled connection that the network or the database pooler dropped silently would make the next query
+        # wait forever (while holding the save lock). Recycle idle connections, and let the OS notice a dead peer
+        # within ~30 s, so the query fails, pre-ping opens a fresh connection, and the save goes through.
+        kw["pool_recycle"] = 240
+        kw["connect_args"] = {"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 20, "keepalives_interval": 5,
+                              "keepalives_count": 3, "tcp_user_timeout": 30000}
     _engine = create_engine(url, **kw)
     meta.create_all(_engine)  # ponytail: create-if-missing, no migration tool; add Alembic when the schema first changes
     blobs.init(data_dir)

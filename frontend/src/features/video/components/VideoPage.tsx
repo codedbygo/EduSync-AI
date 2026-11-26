@@ -9,6 +9,7 @@ import { TimelineEditor } from "./TimelineEditor"
 import { VideoHistory } from "./VideoHistory"
 
 const fileCls = "block w-full rounded-lg border bg-background p-2 text-sm"
+const TUNNEL = window.location.hostname.endsWith(".trycloudflare.com") // the free tunnel caps uploads at 100 MB
 
 export function VideoPage() {
   const { job } = useSearch({ from: "/video" })
@@ -49,6 +50,9 @@ export function VideoPage() {
               <Label htmlFor="vf">Presenter video (MP4, MOV, MKV, WebM)</Label>
               <input id="vf" type="file" accept="video/*" className={fileCls} onChange={(e) => d.set({ video: e.target.files?.[0] })} />
               {d.video && <p className="text-sm text-muted-foreground">Selected: {d.video.name} ({(d.video.size / 1048576).toFixed(1)} MB)</p>}
+              {d.video && d.video.size > 100 * 1048576 && TUNNEL && (
+                <WarnNote message="This video is over 100 MB, the upload limit of this public link, so the upload will be refused. Compress it first, for example to 720p." />
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor="df">Slides (PPTX, PPT, PDF)</Label>

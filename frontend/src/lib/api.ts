@@ -10,6 +10,8 @@ export async function request<T>(url: string, schema: z.ZodType<T>, init?: Reque
   }
   if (!res.ok) {
     let detail = `Request failed (${res.status})`
+    // the public tunnel rejects bodies over 100 MB with its own HTML page, before the server sees them
+    if (res.status === 413) detail = "This file is too large to upload through this link (the limit is 100 MB). Compress the video, for example to 720p, and try again."
     try {
       const body = (await res.json()) as { detail?: unknown }
       if (typeof body.detail === "string") detail = body.detail

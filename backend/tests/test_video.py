@@ -191,9 +191,173 @@ def test_hosted_transcription_request_and_fallback(monkeypatch):
 
 def test_match_accepts_a_bare_list_from_the_model(monkeypatch):
     from app import llm
-    segs = [{"start": 0.0, "end": 5.0, "text": "a"}, {"start": 10.0, "end": 15.0, "text": "b"}]
+    segs = [{"start": 0.0, "end": 4.0, "text": "hello"}, {"start": 5.0, "end": 9.0, "text": "a"}, {"start": 10.0, "end": 15.0, "text": "b"}]
     monkeypatch.setattr(llm, "available", lambda: True)
-    answer = json.dumps([{"slide": 1, "segment": 0, "confidence": 0.9}, {"slide": 2, "segment": 1, "confidence": 0.9}])
+    answer = json.dumps([{"slide": 1, "segment": 1, "confidence": 0.9}, {"slide": 2, "segment": 2, "confidence": 0.9}])
     monkeypatch.setattr(llm, "generate_json", lambda *a, **k: llm.parse_json(answer))
     r = video.match(["one", "two"], segs, 30.0)
     assert [t["slide"] for t in r["timeline"]] == [1, 2] and not r["weak"]
+
+
+def test_gemini_moves_to_next_model_at_once_when_busy(monkeypatch):
+    import httpx
+    from app import llm
+    calls = []
+
+    def post(url, **kw):
+        calls.append(url.split("/models/")[1].split(":")[0])
+        if "busy" in url:
+            return httpx.Response(503, text="high demand")
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": '{"ok": 1}'}]}}]})
+
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setenv("GEMINI_MODEL", "busy-a,busy-b,good")
+    monkeypatch.setattr(llm.httpx, "post", post)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("must not wait")))
+    assert llm.generate_json("x", provider="gemini") == {"ok": 1}
+    assert calls == ["busy-a", "busy-b", "good"]
+
+
+# Real lines from job 12300b4906d3 (851 s video, 21 slides): she announces each slide by number.
+CUE_SEGS = [
+    {"start": 12.9, "end": 21.16, "text": "and Online Education of Assam Downtown University. Slide 1. Now in our previous module we talked"},
+    {"start": 43.6, "end": 53.8, "text": "and also describe the training cycle slide 2 let us now connect this video with the previous module"},
+    {"start": 81.84, "end": 91.18, "text": "therefore training requires a systematic process. Slide 3. Now the training process it is a planned"},
+    {"start": 203.34, "end": 221.4, "text": "identifying the need it provides the foundation for effective training slide six now once the need is identified the next step is establishing training objectives Now objectives it describes what learners should know or be able to do after training"},
+    {"start": 463.85, "end": 464.83, "text": "Slide 12."},
+    {"start": 592.59, "end": 594.49, "text": "Slide 15."},
+    {"start": 700.0, "end": 705.0, "text": "as we saw in slide 3 the process is a cycle"},  # a look back, not a slide change
+    {"start": 764.01, "end": 765.11, "text": "Slide 19."},
+    {"start": 818.61, "end": 825.83, "text": "future training again slide 20 so with this thank you all of you for joining me"},
+]
+
+
+def test_spoken_cues_anchor_slides_where_she_says_them():
+    a = video.spoken_anchors(CUE_SEGS, [""] * 21)  # image-only deck: the spoken number is taken literally
+    spoken = {1: 16.5, 2: 47.5, 3: 86.5, 6: 208.5, 12: 463.9, 15: 592.6, 19: 764.0, 20: 818.6}  # when "slide N" is heard
+    assert set(a) == set(spoken)  # the later "as we saw in slide 3" is ignored
+    for k, t in spoken.items():
+        assert abs(a[k] - t) <= 2.0, (k, a[k], t)
+    # the old even split put these 18 to 50 s too early; anchors must not
+    for k, even in {12: 445.8, 15: 567.4, 19: 729.5, 20: 770.0}.items():
+        assert a[k] - even > 15
+
+
+def test_slides_without_a_cue_sit_between_their_neighbours_not_across_the_video():
+    a = video.spoken_anchors(CUE_SEGS, [""] * 21)
+    tl = {t["slide"]: t["start"] for t in video.fill_timeline(a, {}, 21, 851.05)}
+    assert tl[1] == a[1] and tl[12] == a[12]
+    assert a[3] < tl[4] < tl[5] < a[6]  # 4 and 5 spread between slide 3 and slide 6
+    assert a[20] < tl[21] < 851.05
+    assert list(tl) == sorted(tl) and list(tl.values()) == sorted(tl.values())
+
+
+def test_ai_fills_only_uncued_slides_and_only_between_neighbours():
+    a = {1: 10.0, 3: 100.0}
+    tl = {t["slide"]: (t["start"], t["reason"]) for t in video.fill_timeline(a, {2: (50.0, 0.9, "ai"), 3: (300.0, 0.9, "ai")}, 3, 200.0)}
+    assert tl[2] == (50.0, "ai") and tl[3][0] == 100.0  # the cue wins over the AI for slide 3
+    tl = {t["slide"]: t["start"] for t in video.fill_timeline(a, {2: (150.0, 0.9, "ai")}, 3, 200.0)}
+    assert tl[2] == 55.0  # an AI time past slide 3's cue is refused; interpolated instead
+
+
+def test_parse_json_handles_fences_wrappers_prose_and_garbage():
+    from app import llm
+    assert llm.parse_json('```json\n{"timeline": [1]}\n```') == {"timeline": [1]}
+    assert llm.parse_json('Here you go:\n[{"slide": 1}]\nHope this helps') == {"items": [{"slide": 1}]}
+    assert llm.parse_json('{"a": {"b": [1, 2]}} trailing') == {"a": {"b": [1, 2]}}
+    for bad in ("", "no json here", '{"timeline": [1, 2'):
+        with pytest.raises(llm.ParseError):
+            llm.parse_json(bad)
+
+
+def test_bad_ai_answer_is_retried_once_with_a_stricter_prompt(monkeypatch):
+    from app import llm
+    segs = [{"start": 0.0, "end": 4.0, "text": "hello"}, {"start": 5.0, "end": 9.0, "text": "intro"}, {"start": 20.0, "end": 25.0, "text": "photosynthesis"}]
+    prompts = []
+
+    def answer(prompt, *a, **k):
+        prompts.append(prompt)
+        return llm.parse_json("not json at all" if len(prompts) == 1 else '[{"slide":1,"segment":1,"confidence":0.9},{"slide":2,"segment":2,"confidence":0.8}]')
+
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "generate_json", answer)
+    r = video.match(["intro", "photosynthesis"], segs, 40.0)
+    assert len(prompts) == 2 and "could not be used" in prompts[1] and "could not be used" not in prompts[0]
+    assert [(t["slide"], t["start"]) for t in r["timeline"]] == [(1, 5.0), (2, 20.0)] and not r["weak"]
+
+
+def test_timeline_rules_are_checked():
+    assert video.check_timeline([{"slide": 1, "start": 0}, {"slide": 2, "start": 9}], 2, 10) is None
+    assert "increase" in video.check_timeline([{"slide": 1, "start": 5}, {"slide": 2, "start": 3}], 2, 10)
+    assert "outside" in video.check_timeline([{"slide": 1, "start": 0}, {"slide": 2, "start": 12}], 2, 10)
+    assert "one entry per slide" in video.check_timeline([{"slide": 1, "start": 0}], 2, 10)
+
+
+def test_nothing_matched_is_a_clearly_marked_guess(monkeypatch):
+    from app import llm
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "generate_json", lambda *a, **k: (_ for _ in ()).throw(llm.LLMError("all models busy")))
+    r = video.match(["a", "b"], [{"start": 0.0, "end": 3.0, "text": "hello"}], 30.0)
+    assert r["weak"] and "GUESS" in r["note"] and "all models busy" in r["note"] and "Use current time" in r["note"]
+
+
+def test_cue_numbers_are_matched_to_the_deck_by_content():
+    """Her "slide 1" is the deck's 3rd slide: she does not count the name card and the title slide."""
+    deck = ["Dr Mumpi Das Assistant Professor University", "Training and Development video lecture semester",
+            "Learning Objectives explain meaning concept training process describe steps",
+            "Training is important improve knowledge skills enhance performance",
+            "Meaning of Training Process systematic sequence activities identify needs objectives"]
+    segs = [
+        {"start": 0.0, "end": 10.0, "text": "Hello, I am Dr Mumpi Das, assistant professor at the university."},
+        {"start": 10.0, "end": 20.0, "text": "Slide 1. In this video we explain the meaning and concept of the training process and describe its steps."},
+        {"start": 40.0, "end": 50.0, "text": "Slide 2. Training is important: it improves knowledge and skills and enhances performance."},
+        {"start": 80.0, "end": 90.0, "text": "Slide 3. Now the training process is a systematic sequence of activities, from needs to objectives."},
+    ]
+    a = video.spoken_anchors(segs, deck)
+    assert sorted(a) == [3, 4, 5] and a[3] < a[4] < a[5]
+    assert abs(a[4] - 39.5) < 1  # the time still comes from when "slide 2" is said
+
+
+def test_uncued_slides_are_placed_by_their_text_between_the_cues():
+    deck = ["Photosynthesis basics", "Chlorophyll absorbs light energy in leaves", "Calvin cycle builds glucose"]
+    segs = [{"start": 0.0, "end": 5.0, "text": "Slide 1. Today we look at photosynthesis."},
+            {"start": 10.0, "end": 15.0, "text": "Plants need sunlight."},
+            {"start": 30.0, "end": 35.0, "text": "Chlorophyll in the leaves absorbs the light energy."},
+            {"start": 60.0, "end": 65.0, "text": "Slide 3. The Calvin cycle builds glucose."}]
+    a = video.spoken_anchors(segs, deck)
+    assert sorted(a) == [1, 3]
+    p = video.text_proposals(a, deck, segs, 80.0)
+    assert p[2][0] == 30.0 and p[2][2] == video.TEXT_REASON  # not 10.0 (no shared words), not interpolated 29.7
+    r = video.match(deck, segs, 80.0)
+    assert [(t["slide"], t["start"]) for t in r["timeline"]] == [(1, 0.0), (2, 30.0), (3, 59.5)] and not r["weak"]
+
+
+def test_ai_is_asked_only_for_slides_the_cues_did_not_place(monkeypatch):
+    from app import llm
+    segs = [{"start": float(i * 10), "end": float(i * 10 + 5), "text": f"sentence {i}"} for i in range(6)]
+    asked = []
+
+    def answer(prompt, *a, **k):
+        asked.append(prompt)
+        return {"timeline": [{"slide": 2, "segment": 2, "confidence": 0.8}]}
+
+    monkeypatch.setattr(llm, "generate_json", answer)
+    p, problem = video.ai_proposals(["a", "b", "c"], segs, 60.0, {1: 0.0, 3: 40.0})
+    assert problem is None and p == {2: (20.0, 0.8, "matched by AI")}
+    assert "Slide 1 starts at sentence #0" in asked[0] and "Slide 3 starts at sentence #4" in asked[0]
+    assert "each of these slides: 2." in asked[0]
+
+
+def test_the_greeting_stays_a_full_screen_intro(monkeypatch):
+    """Even when the AI or the slide text points at the first sentence, slides start after it; a cue still wins."""
+    from app import llm
+    segs = [{"start": 0.0, "end": 6.0, "text": "Hello learners, I am Dr Das and this is photosynthesis."},
+            {"start": 6.0, "end": 12.0, "text": "Photosynthesis turns light into sugar."},
+            {"start": 30.0, "end": 35.0, "text": "Slide 2. The Calvin cycle builds glucose."},
+            {"start": 50.0, "end": 55.0, "text": "Slide 3. Summary of the lesson."}]
+    deck = ["Photosynthesis light sugar Dr Das", "Calvin cycle glucose", "Summary lesson"]
+    monkeypatch.setattr(llm, "available", lambda: False)
+    tl = video.match(deck, segs, 60.0)["timeline"]
+    assert tl[0]["slide"] == 1 and tl[0]["start"] == 6.0  # 0 to 6 s: presenter full screen, then the slides fade in
+    cue_first = [{"start": 0.0, "end": 8.0, "text": "Slide 1. Photosynthesis turns light into sugar."}] + segs[2:]
+    assert video.match(deck, cue_first, 60.0)["timeline"][0]["start"] == 0.0  # she starts on a slide: no intro

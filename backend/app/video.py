@@ -122,20 +122,27 @@ def _local_transcribe(video: Path) -> list[dict]:
 
 
 # ---------- matching ----------
-def build_match_prompt(slide_texts: list[str], segments: list[dict]) -> str:
+def build_match_prompt(slide_texts: list[str], segments: list[dict], known: dict[int, int] | None = None) -> str:
+    """known: deck slide -> transcript sentence already fixed by a spoken cue; the model is asked only for the rest."""
     slides = "\n".join(f"Slide {i}: {t[:600] or '(no text, image only)'}" for i, t in enumerate(slide_texts, 1))
     tr = "\n".join(f"#{i} [{s['start']:.1f}s] {s['text']}" for i, s in enumerate(segments))
+    want = [k for k in range(1, len(slide_texts) + 1) if k not in (known or {})]
+    placed = ("\nALREADY PLACED from the speaker's own slide announcements (these deck slide numbers are correct, do not return them):\n"
+              + "\n".join(f"Slide {k} starts at sentence #{i}" for k, i in sorted(known.items())) + "\n") if known else ""
     return f"""A presenter talks through a slide deck. Decide at what time each slide starts being discussed.
 Use meaning (topic, concepts, paraphrase), not just shared words. Slides appear in order unless the speaker clearly goes back.
-If the speaker greets or introduces themself before talking about slide 1, slide 1 starts at the first sentence about its content (the earlier part is shown as a full-screen presenter intro). Skip slides the speaker never discusses.
+If the speaker greets or introduces themself before talking about slide 1, slide 1 starts at the first sentence about its content (the earlier part is shown as a full-screen presenter intro).
+A spoken "slide 5" or "next slide" marks a slide change, but the speaker's numbers may not match the deck's numbering (title slides are often not counted).
+For a slide the speaker never clearly discusses, pick the most plausible sentence and give it a low confidence.
 
 SLIDES:
 {slides}
 
 TRANSCRIPT (numbered sentences with start times):
 {tr}
-
+{placed}
 Choose the transcript sentence number where the speaker STARTS talking about each slide (the sentence that introduces or transitions into it, not one in the middle of its discussion).
+Return exactly one entry for each of these slides: {", ".join(map(str, want))}.
 Return JSON: {{"timeline":[{{"slide":1,"segment":0,"confidence":0.0-1.0,"reason":"short"}}]}}
 Sorted by segment. confidence = how sure you are the speech at that time is about that slide."""
 
@@ -187,28 +194,249 @@ def clean_timeline(raw: list[dict], n_slides: int, duration: float) -> list[dict
 
 def even_draft(n_slides: int, duration: float) -> list[dict]:
     step = duration / n_slides
-    return [{"slide": i + 1, "start": round(i * step, 2), "confidence": 0.0, "reason": "even split draft, not matched"} for i in range(n_slides)]
+    return [{"slide": i + 1, "start": round(i * step, 2), "confidence": 0.0, "reason": "evenly spaced guess, not matched"} for i in range(n_slides)]
+
+
+# ---------- spoken cues: "Slide 4", "slide six", "next slide" ----------
+_NUMS = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+CUE = re.compile(r"\b(?:slide\s+(?:number\s+|no\.?\s*)?(\d{1,3}|" + "|".join(sorted(_NUMS, key=len, reverse=True)) + r")\b|next\s+slide\b)", re.I)
+LEAD = 0.5  # seconds: the slide appears just before the cue is spoken
+CUE_REASON, GAP_REASON = "spoken cue (\"slide N\" or \"next slide\")", "placed between neighbouring slides (no cue found)"
+
+
+_STOP = set("this that with from have will what which their they there about into them then than also these those very when where "
+             "your said slide here just like know because been were would could should being some such each other more most only over "
+             "under after before again now".split())
+
+
+def _words(text: str) -> set[str]:
+    return {w[:-1] if w.endswith("s") else w for w in re.findall(r"[a-z]{4,}", text.lower())} - _STOP
+
+
+def _cues(segments: list[dict]) -> list[tuple[float, int | None, str]]:
+    """(time the cue is spoken, the number said or None for "next slide", what is said right after it: the rest of
+    its sentence and the sentences that start within 15 s, at most 3, never past the next cue). Later speech may be
+    about a slide that has no cue of its own. The time is estimated inside its sentence (Whisper times sentences)."""
+    found = []
+    for i, s in enumerate(segments):
+        text, t0 = s["text"], float(s["start"])
+        span = max(0.0, float(s.get("end", t0)) - t0)
+        for m in CUE.finditer(text):
+            g = (m.group(1) or "").lower()
+            found.append((max(0.0, t0 + span * m.start() / max(len(text), 1) - LEAD), int(g) if g.isdigit() else _NUMS.index(g) if g else None, i, m.end()))
+    out = []
+    for c, (t, k, i, end) in enumerate(found):
+        nxt = found[c + 1][0] if c + 1 < len(found) else float("inf")
+        after = [s["text"] for s in segments[i + 1:i + 4] if float(s["start"]) < min(nxt, t + 15)]
+        out.append((t, k, " ".join([segments[i]["text"][end:]] + after)))
+    return out
+
+
+def spoken_anchors(segments: list[dict], slide_texts: list[str]) -> dict[int, float]:
+    """Deck slide -> time the presenter moves to it, from "slide N" / "next slide" cues.
+    The time of a cue is trusted; the number is only a hint. Presenters often number from their first content
+    slide (skipping title slides), or count a slide the uploaded deck does not have, so each cue is matched to
+    the deck slide whose text best fits what is said after it. Order is kept (deck slides only go up), a steady
+    numbering offset is preferred, and a cue that fits no slide (a look back, "as we saw in slide 3") is skipped.
+    Image-only decks give no text to compare, so the spoken number is taken literally. Fewer than 2 cues: none."""
+    cues, n = _cues(segments), len(slide_texts)
+    if len(cues) < 2:
+        return {}
+    sw = [_words(t) for t in slide_texts]
+    fit = [[0.0] + [len(sw[j - 1] & _words(win)) / max(len(sw[j - 1]), 1) for j in range(1, n + 1)] for _, _, win in cues]
+    OFFSET_CHANGE, SKIP_CUE = 0.15, 0.1  # a jump the spoken numbers explain is free; changing the offset is not
+    NEG = float("-inf")
+    # f[i][j]: best score with cue i opening deck slide j as the latest assignment; back[i][j]: (previous cue, slide)
+    f = [[NEG] * (n + 1) for _ in cues]
+    back: list[list[tuple[int, int] | None]] = [[None] * (n + 1) for _ in cues]
+    for i, (_, k, _) in enumerate(cues):
+        for j in range(1, n + 1):
+            hint = -0.01 * abs(j - k) if k else 0.0
+            f[i][j], back[i][j] = fit[i][j] + hint - SKIP_CUE * i, None  # first assigned cue; earlier cues skipped
+            for p in range(i):  # O(cues^2 * slides^2): a few hundred thousand steps for a long lecture
+                for pj in range(1, j):
+                    if f[p][pj] == NEG:
+                        continue
+                    kp = cues[p][1]
+                    steady = (j - pj == 1) if (k is None or kp is None) else (j - k == pj - kp)
+                    s = f[p][pj] + fit[i][j] + hint - SKIP_CUE * (i - p - 1) - (0 if steady else OFFSET_CHANGE)
+                    if s > f[i][j]:
+                        f[i][j], back[i][j] = s, (p, pj)
+    end = max(((i, j) for i in range(len(cues)) for j in range(1, n + 1)), key=lambda ij: f[ij[0]][ij[1]] - SKIP_CUE * (len(cues) - 1 - ij[0]))
+    out: dict[int, float] = {}
+    cur: tuple[int, int] | None = end
+    while cur:
+        out[cur[1]] = round(cues[cur[0]][0], 2)
+        cur = back[cur[0]][cur[1]]
+    return out if len(out) >= 2 else {}
+
+
+def intro_end(segments: list[dict]) -> float:
+    """The opening sentence (the greeting) always plays as the full-screen intro, original background and all;
+    the slides fade in when it ends. A spoken "slide N" before then still wins."""
+    return float(segments[0]["end"]) if segments else 0.0
+
+
+def fill_timeline(anchors: dict[int, float], proposals: dict[int, tuple[float, float, str]], n: int, duration: float,
+                  intro: float = 0.0) -> list[dict]:
+    """Cues first; AI proposals only for slides without a cue and only where they fit between the cues around
+    them (and not inside the intro); every other slide is spread between its nearest placed neighbours (never
+    across the whole video)."""
+    known = {k: (t, 1.0, CUE_REASON) for k, t in anchors.items()}
+    first = min(known.values(), default=(duration,))[0]
+    intro = max(0.0, min(intro, first - MIN_DWELL))  # a cue inside the greeting shortens the intro
+    for k in sorted(proposals):
+        if k in known:
+            continue
+        lo = max((known[j][0] for j in known if j < k), default=intro - 1e-6)
+        hi = min((known[j][0] for j in known if j > k), default=duration)
+        if lo < proposals[k][0] < hi:
+            known[k] = proposals[k]
+    known.setdefault(1, (intro, 0.3, GAP_REASON))
+    fixed = dict(known)
+    for k in range(2, n + 1):
+        if k not in fixed:
+            a = max(j for j in fixed if j < k)
+            b = min((j for j in fixed if j > k), default=n + 1)
+            ta, tb = fixed[a][0], fixed[b][0] if b <= n else duration
+            known[k] = (ta + (tb - ta) * (k - a) / (b - a), 0.3, GAP_REASON)
+    raw = [{"slide": k, "start": t, "confidence": c, "reason": why} for k, (t, c, why) in known.items()]
+    return clean_timeline(raw, n, duration)
+
+
+TEXT_REASON = "matched by slide text"
+
+
+def text_proposals(anchors: dict[int, float], slide_texts: list[str], segments: list[dict], duration: float,
+                   intro: float = 0.0) -> dict[int, tuple[float, float, str]]:
+    """Instant, no AI: for each slide without a cue, the sentence between its placed neighbours whose words (with the
+    next two sentences, if they start within 15 s) cover the most of the slide's words. Slides are taken in order so two missing neighbours
+    cannot swap. A slide covered less than 30% is left for the AI or for interpolation."""
+    sw = [_words(t) for t in slide_texts]
+    placed = dict(anchors)
+    out: dict[int, tuple[float, float, str]] = {}
+    for k in range(1, len(slide_texts) + 1):
+        if k in placed or not sw[k - 1]:
+            continue
+        lo = max((t for j, t in placed.items() if j < k), default=-1.0)
+        hi = min((t for j, t in placed.items() if j > k), default=duration)
+        best, at = 0.0, None
+        floor = intro if lo < 0 else lo + MIN_DWELL  # after the intro; leave each neighbour at least MIN_DWELL on screen
+        for i, s in enumerate(segments):
+            t = float(s["start"])
+            if floor <= t <= hi - MIN_DWELL:
+                near = " ".join(x["text"] for x in segments[i:i + 3] if float(x["start"]) < t + 15)
+                cover = len(sw[k - 1] & _words(near)) / len(sw[k - 1])
+                if cover > best:
+                    best, at = cover, t
+        if at is not None and best >= 0.3:
+            out[k] = (at, round(min(0.9, 0.4 + best), 2), TEXT_REASON)
+            placed[k] = at
+    return out
+
+
+# ---------- AI matching for slides without a cue ----------
+STRICT = """
+
+Your previous answer could not be used ({problem}). Reply with ONLY this JSON object and nothing else, no code fences:
+{{"timeline":[{{"slide":1,"segment":0,"confidence":0.9,"reason":"short"}}]}}
+Exactly one entry for each of these slides, in order: {slides}. Segment numbers must only go up."""
+
+
+def _timeline_items(res: dict) -> list:
+    """The list in the reply, whether bare or wrapped as {"timeline": [...]} or under another key."""
+    for key in ("timeline", "items", "slides"):
+        if isinstance(res.get(key), list):
+            return res[key]
+    return next((v for v in res.values() if isinstance(v, list)), [])
+
+
+def check_timeline(items: list, n: int, duration: float, want: set[int] | None = None) -> str | None:
+    """None when the answer is usable as given, else what is wrong (sent back to the model on the retry).
+    want: the slides that were asked for (default: all of them)."""
+    want = want or set(range(1, n + 1))
+    try:
+        pairs = sorted((int(r["slide"]), float(r["start"])) for r in items)
+    except (KeyError, TypeError, ValueError):
+        return "every entry needs a slide number and a valid segment number"
+    if not pairs:
+        return "the timeline was empty"
+    if any(s not in want for s, _ in pairs):
+        return f"only these slides were asked for: {', '.join(map(str, sorted(want)))}"
+    if any(not 0 <= t < duration for _, t in pairs):
+        return "a time was outside the video"
+    if any(b[1] <= a[1] for a, b in zip(pairs, pairs[1:])):
+        return "start times must increase with the slide number"
+    if len({s for s, _ in pairs}) != len(want):
+        return f"{len({s for s, _ in pairs})} of {len(want)} slides were given, one entry per slide is required"
+    return None
+
+
+def ai_proposals(slide_texts: list[str], segments: list[dict], duration: float,
+                 anchors: dict[int, float] | None = None) -> tuple[dict[int, tuple[float, float, str]], str | None]:
+    """Ask the model for the slides the cues did not place (all of them when there are no cues); on unusable JSON or
+    an answer that breaks the rules, ask once more with a stricter prompt.
+    Returns (slide -> (start, confidence, reason), the problem left after the retry or None)."""
+    n = len(slide_texts)
+    # the sentence each cue falls in, so the model sees the fixed points in its own terms
+    known = {k: max((i for i, s in enumerate(segments) if float(s["start"]) <= t + LEAD), default=0) for k, t in (anchors or {}).items()}
+    want = set(range(1, n + 1)) - set(known)
+    base = build_match_prompt(slide_texts, segments, known)
+    prompt, items, problem = base, [], None
+    for _ in range(2):
+        try:
+            items = segments_to_times(_timeline_items(llm.generate_json(prompt)), segments)
+            problem = check_timeline(items, n, duration, want)
+        except llm.ParseError as e:
+            items, problem = [], str(e)
+        if not problem:
+            break
+        print(f"Slide matching answer rejected: {problem}", flush=True)
+        prompt = base + STRICT.format(problem=problem, slides=", ".join(map(str, sorted(want))))
+    usable = clean_timeline(items, n, duration)  # the best of an imperfect answer still helps
+    return {t["slide"]: (t["start"], t["confidence"], t["reason"] or "matched by AI") for t in usable}, problem
+
+
+def guess(n: int, duration: float, why: str) -> dict:
+    return {"timeline": even_draft(n, duration), "weak": True,
+            "note": f"Could not sync automatically: {why}. The timeline below is only an evenly spaced GUESS, not matched to the speech. "
+                    "Play the video, press \"Use current time\" at each slide change, then render."}
 
 
 def match(slide_texts: list[str], segments: list[dict], duration: float) -> dict:
     """Returns {timeline, weak, note}. weak=True means the UI must ask the human to review."""
     n = len(slide_texts)
     if not segments:
-        return {"timeline": even_draft(n, duration), "weak": True, "note": "No speech detected, so slides could not be matched. Edit the timeline below."}
-    if not llm.available():
-        return {"timeline": even_draft(n, duration), "weak": True, "note": "GEMINI_API_KEY is not set, so automatic matching is off. The timeline below is an even-split draft; edit it, then render."}
-    try:
-        res = llm.generate_json(build_match_prompt(slide_texts, segments))
-        raw = res.get("timeline") or res.get("items") or []
-    except llm.LLMError as e:
-        return {"timeline": even_draft(n, duration), "weak": True, "note": f"Automatic matching failed ({e}). Edit the timeline below."}
-    tl = clean_timeline(segments_to_times(raw, segments), n, duration)
-    covered = len({t["slide"] for t in tl})
+        return guess(n, duration, "no speech was detected")
+    anchors = spoken_anchors(segments, slide_texts)
+    # slides without a cue: an instant text match first; the AI (slow on a busy free tier) only if many are still open
+    intro = max(0.0, min(intro_end(segments), min(anchors.values(), default=duration) - MIN_DWELL))
+    proposals = text_proposals(anchors, slide_texts, segments, duration, intro) if anchors else {}
+    ai_note = ""
+    if len(anchors) + len(proposals) < n * 0.6:
+        if not llm.available():
+            ai_note = "AI matching is off (GEMINI_API_KEY is not set)"
+        else:
+            try:
+                ai, problem = ai_proposals(slide_texts, segments, duration, anchors)
+                proposals = {**ai, **proposals}  # where both answered, the text match (bounded by the cues) wins
+                ai_note = f"the AI answer was imperfect ({problem})" if problem else ""
+            except llm.LLMError as e:
+                ai_note = f"AI matching failed ({e})"
+    if not anchors and not proposals:
+        return guess(n, duration, ai_note or "nothing in the speech could be matched to a slide")
+    tl = fill_timeline(anchors, proposals, n, duration, intro)
+    cue = sum(1 for t in tl if t["reason"] == CUE_REASON)
+    gap = sum(1 for t in tl if t["reason"] == GAP_REASON)
+    txt = sum(1 for t in tl if t["reason"] == TEXT_REASON)
+    ai = len(tl) - cue - gap - txt
     mean_conf = sum(t["confidence"] for t in tl) / len(tl) if tl else 0
-    if not tl or mean_conf < 0.55 or covered < max(1, n * 0.6):
-        return {"timeline": tl or even_draft(n, duration), "weak": True,
-                "note": f"Automatic matching is weak (confidence {mean_conf:.0%}, {covered}/{n} slides matched). Please review the timeline."}
-    return {"timeline": tl, "weak": False, "note": f"Matched {covered}/{n} slides, mean confidence {mean_conf:.0%}."}
+    parts = [f"{cue} from spoken \"slide N\" cues"] + [f"{txt} by slide text"] * bool(txt) + [f"{ai} by AI matching"] * bool(ai) + [f"{gap} between neighbouring slides (check those)"] * bool(gap)
+    note = f"{len(tl)}/{n} slides placed: " + ", ".join(parts) + "."
+    if ai_note:
+        note += f" Note: {ai_note}."
+    weak = not tl or mean_conf < 0.55 or cue + txt + ai < max(1, n * 0.6)
+    return {"timeline": tl, "weak": weak, "note": ("Please review the timeline. " if weak else "") + note}
 
 
 # ---------- background ----------

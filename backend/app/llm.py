@@ -1,15 +1,22 @@
 """LLM client, JSON in/out: Gemini (free tier, key from env) or a local Ollama model (no key, no quota)."""
 import base64
 import json
+import logging
 import os
 import re
 import time
 
 import httpx
 
+log = logging.getLogger("edusync.llm")
+
 
 class LLMError(RuntimeError):
     pass
+
+
+class ParseError(LLMError):
+    """The model answered, but not with usable JSON: worth one retry with a stricter prompt."""
 
 
 def _model() -> str:
@@ -122,7 +129,7 @@ def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, re
             return _call(model, body, key, retries)
         except _DailyQuota as e:
             last = str(e)
-    raise LLMError(f"Every configured Gemini model is out of free daily quota or retired (last tried: {last}). It resets within 24 hours; set GEMINI_MODEL to another model or use a different key.")
+    raise LLMError(f"Every configured Gemini model is busy, out of free quota or retired (last tried: {last}). Press Retry in a few minutes.")
 
 
 class _DailyQuota(Exception):
@@ -134,16 +141,20 @@ def _call(model: str, body: dict, key: str, retries: int) -> dict:
     last = ""
     for attempt in range(retries):
         try:
-            r = httpx.post(url, json=body, headers={"x-goog-api-key": key}, timeout=180)
+            r = httpx.post(url, json=body, headers={"x-goog-api-key": key}, timeout=httpx.Timeout(120, connect=15))
+        except httpx.TimeoutException:
+            raise _DailyQuota(f"{model}: timed out")  # a stuck model: try the next one instead of waiting again
         except httpx.HTTPError as e:
             last = f"network error: {e}"
             time.sleep(2 ** attempt)
             continue
         if (r.status_code == 429 and "PerDay" in r.text) or r.status_code == 404:  # quota used up or model retired
             raise _DailyQuota(f"{model}: HTTP {r.status_code} {r.text[:160]}")
-        if r.status_code in (500, 503) and attempt >= 1:
-            raise _DailyQuota(f"{model}: HTTP {r.status_code}")  # overloaded: move on to the next model instead of waiting
-        if r.status_code in (429, 500, 503):
+        if r.status_code in (500, 503):
+            raise _DailyQuota(f"{model}: HTTP {r.status_code}")  # overloaded: move on to the next model at once
+        if r.status_code == 429:
+            if attempt >= 1:
+                raise _DailyQuota(f"{model}: HTTP 429 twice")  # still rate limited: the next model has its own quota
             last = f"HTTP {r.status_code} (rate limit or overload)"
             time.sleep(min(60, 15 * (attempt + 1)))  # free tier: per-minute quota resets within a minute
             continue
@@ -158,14 +169,15 @@ def _call(model: str, body: dict, key: str, retries: int) -> dict:
 
 
 def parse_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    """The first JSON object or array in the reply, with code fences and any prose around it ignored.
+    A bare array comes back as {"items": [...]}."""
+    body = re.sub(r"```(?:json)?", "", text or "", flags=re.I)
+    starts = [i for i in (body.find("{"), body.find("[")) if i >= 0]
     try:
-        out = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise LLMError(f"Model returned invalid JSON: {e}")
-    if isinstance(out, list):  # some models answer with the bare list instead of {"key": [...]}
-        out = {"items": out}
-    if not isinstance(out, dict):
-        raise LLMError("Model returned JSON that is not an object")
-    return out
+        if not starts:
+            raise ValueError("no JSON object or array in the reply")
+        out, _ = json.JSONDecoder().raw_decode(body[min(starts):])
+    except ValueError as e:  # JSONDecodeError is a ValueError
+        log.warning("Unparseable model reply (%s): %s", e, (text or "")[:4000])
+        raise ParseError(f"Model returned invalid JSON: {e}")
+    return {"items": out} if isinstance(out, list) else out

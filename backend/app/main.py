@@ -300,9 +300,10 @@ def rerender(jid: str, body: RenderBody):
 @app.post("/api/video/jobs/{jid}/retry")
 def retry_video(jid: str):
     job = load(jid, "video")
-    if job["stage"] not in ("error", "interrupted"):
-        raise HTTPException(409, "Only a failed or interrupted job can be retried.")
-    pr = job.get("pending_render")
+    if job["stage"] in RUNNING:
+        raise HTTPException(409, "Job is still busy.")
+    # failed mid-render: render the same timeline again; otherwise (failed, interrupted, review or done) analyse again
+    pr = job.get("pending_render") if job["stage"] in ("error", "interrupted") else None
     update(jid, stage="queued", error=None, message="Queued", progress=0.0, owner=INSTANCE)
     if pr:  # it died while rendering: render the same timeline again
         heavy.submit(runner(jid, render_job, pr["timeline"], pr["chroma"]))
