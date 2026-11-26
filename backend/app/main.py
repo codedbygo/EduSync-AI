@@ -235,6 +235,12 @@ def analyse(jid: str, auto_render: bool):
     with ThreadPoolExecutor(8) as ex:  # network bound: parallel uploads instead of one at a time
         keys = list(ex.map(lambda p: keep(jid, f"video/{jid}/slides/{p.name}", p, "image/png"), imgs))
     files["slides"] = [k for k in keys if k]
+    bare = [i for i, t in enumerate(texts) if len(t.split()) < 4]  # image-only slides: describe them so speech can match
+    if bare and llm.available():
+        update(jid, progress=0.13, message=f"Reading {len(bare)} picture-only slide(s)")
+        with ThreadPoolExecutor(4) as ex:
+            for i, desc in zip(bare, ex.map(lambda i: llm.describe_image(imgs[i].read_bytes(), "image/png"), bare)):
+                texts[i] = f"{texts[i]} {desc}".strip()
     update(jid, files=files, n_slides=len(imgs), slide_texts=texts, stage="transcribing", progress=0.15, message="Transcribing speech (Whisper)")
     duration = video.probe_duration(vpath)
     segs = video.transcribe(vpath)

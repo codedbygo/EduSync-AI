@@ -59,9 +59,10 @@ def wait(c, jid, until):
 
 
 def test_end_to_end_manual_timeline_renders_valid_mp4(client):
-    r = client.post("/api/video/jobs", files={"video_file": open(S / "presenter_greenscreen.mp4", "rb"), "deck_file": open(S / "lecture_slides.pptx", "rb")})
+    r = client.post("/api/video/jobs", data={"auto_render": "false"},
+                    files={"video_file": open(S / "presenter_greenscreen.mp4", "rb"), "deck_file": open(S / "lecture_slides.pptx", "rb")})
     s = wait(client, r.json()["id"], {"review"})
-    assert s["n_slides"] == 4 and s["weak"] and s["segments"], s            # no key -> weak draft, speech was transcribed
+    assert s["n_slides"] == 4 and s["timeline"] and s["segments"], s        # matched from the speech, waiting for render
     jid = s["id"]
     tl = [{"slide": 1, "start": 0}, {"slide": 2, "start": 11.36}, {"slide": 3, "start": 30.88}, {"slide": 4, "start": 47.44}]
     assert client.post(f"/api/video/jobs/{jid}/render", json={"timeline": tl}).status_code == 200
@@ -326,8 +327,8 @@ def test_uncued_slides_are_placed_by_their_text_between_the_cues():
             {"start": 60.0, "end": 65.0, "text": "Slide 3. The Calvin cycle builds glucose."}]
     a = video.spoken_anchors(segs, deck)
     assert sorted(a) == [1, 3]
-    p = video.text_proposals(a, deck, segs, 80.0)
-    assert p[2][0] == 30.0 and p[2][2] == video.TEXT_REASON  # not 10.0 (no shared words), not interpolated 29.7
+    p, how = video.content_proposals(a, deck, segs, 80.0)
+    assert how == "shared words" and p[2][0] == 30.0 and p[2][2] == video.TEXT_REASON  # not 10.0: nothing shared
     r = video.match(deck, segs, 80.0)
     assert [(t["slide"], t["start"]) for t in r["timeline"]] == [(1, 0.0), (2, 30.0), (3, 59.5)] and not r["weak"]
 
@@ -361,3 +362,38 @@ def test_the_greeting_stays_a_full_screen_intro(monkeypatch):
     assert tl[0]["slide"] == 1 and tl[0]["start"] == 6.0  # 0 to 6 s: presenter full screen, then the slides fade in
     cue_first = [{"start": 0.0, "end": 8.0, "text": "Slide 1. Photosynthesis turns light into sugar."}] + segs[2:]
     assert video.match(deck, cue_first, 60.0)["timeline"][0]["start"] == 0.0  # she starts on a slide: no intro
+
+
+@pytest.mark.real_embeddings
+def test_slides_follow_what_is_said_with_no_slide_numbers():
+    """No "slide N" anywhere: paraphrased speech is matched to the deck by meaning (real local sentence model)."""
+    deck = ["Photosynthesis: plants convert light energy into chemical energy",
+            "Inputs and outputs: carbon dioxide and water in, glucose and oxygen out",
+            "Average speed equals distance divided by time",
+            "Summary and homework"]
+    segs = [{"start": 0.0, "end": 5.0, "text": "Hello everyone, welcome back to the class."},
+            {"start": 5.0, "end": 15.0, "text": "Green plants capture sunlight and store it as chemical energy."},
+            {"start": 15.0, "end": 25.0, "text": "That stored energy is what feeds almost every living thing."},
+            {"start": 25.0, "end": 35.0, "text": "What goes in? CO2 from the air and water from the roots."},
+            {"start": 35.0, "end": 45.0, "text": "What comes out is sugar, plus the O2 we breathe."},
+            {"start": 45.0, "end": 55.0, "text": "Switching topics: a car covers 150 kilometres in two and a half hours."},
+            {"start": 55.0, "end": 65.0, "text": "Divide how far it went by how long it took and you get 60 km per hour."},
+            {"start": 65.0, "end": 75.0, "text": "To wrap up, please finish the exercises at home before Friday."}]
+    r = video.match(deck, segs, 80.0)
+    assert [(t["slide"], t["start"]) for t in r["timeline"]] == [(1, 5.0), (2, 25.0), (3, 45.0), (4, 65.0)], r
+    assert not r["weak"] and "meaning" in r["note"]
+
+
+def test_a_slow_ai_never_holds_up_the_job(monkeypatch):
+    import time
+    from app import llm
+    monkeypatch.setattr(llm, "available", lambda: True)
+    monkeypatch.setattr(llm, "generate_json", lambda *a, **k: (time.sleep(3), {})[1])
+    monkeypatch.setattr(video, "AI_DEADLINE", 0.5)
+    deck = ["photosynthesis light energy", "calvin cycle glucose"]
+    segs = [{"start": 0.0, "end": 4.0, "text": "hello"}, {"start": 5.0, "end": 9.0, "text": "photosynthesis uses light energy"},
+            {"start": 20.0, "end": 25.0, "text": "the calvin cycle makes glucose"}]
+    t = time.time()
+    r = video.match(deck, segs, 30.0)
+    assert time.time() - t < 2.5 and not r["weak"] and "did not answer within" in r["note"]
+    assert [(x["slide"], x["start"]) for x in r["timeline"]] == [(1, 5.0), (2, 20.0)]

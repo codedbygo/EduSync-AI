@@ -5,8 +5,10 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Callable
 
+import numpy as np
 import pymupdf
 from PIL import Image
 
@@ -16,6 +18,7 @@ W, H, FPS = 1280, 720, 30
 PIP_W, PIP_H, PIP_M = 360, 270, 20  # presenter window (bottom right) and its margin from the edges
 MIN_DWELL = 2.0         # seconds; shorter slide segments are merged into the previous slide
 _whisper = None
+_ai_pool = ThreadPoolExecutor(2)  # AI matching runs here so the job can stop waiting at the deadline
 
 
 class VideoError(RuntimeError):
@@ -278,20 +281,21 @@ def intro_end(segments: list[dict]) -> float:
 
 
 def fill_timeline(anchors: dict[int, float], proposals: dict[int, tuple[float, float, str]], n: int, duration: float,
-                  intro: float = 0.0) -> list[dict]:
+                  intro: float = 0.0, backup: dict[int, tuple[float, float, str]] | None = None) -> list[dict]:
     """Cues first; AI proposals only for slides without a cue and only where they fit between the cues around
     them (and not inside the intro); every other slide is spread between its nearest placed neighbours (never
     across the whole video)."""
     known = {k: (t, 1.0, CUE_REASON) for k, t in anchors.items()}
     first = min(known.values(), default=(duration,))[0]
     intro = max(0.0, min(intro, first - MIN_DWELL))  # a cue inside the greeting shortens the intro
-    for k in sorted(proposals):
-        if k in known:
-            continue
-        lo = max((known[j][0] for j in known if j < k), default=intro - 1e-6)
-        hi = min((known[j][0] for j in known if j > k), default=duration)
-        if lo < proposals[k][0] < hi:
-            known[k] = proposals[k]
+    for props in (proposals, backup or {}):  # the backup only fills slides the first set could not place in order
+        for k in sorted(props):
+            if k in known:
+                continue
+            lo = max((known[j][0] for j in known if j < k), default=intro - 1e-6)
+            hi = min((known[j][0] for j in known if j > k), default=duration)
+            if lo < props[k][0] < hi:
+                known[k] = props[k]
     known.setdefault(1, (intro, 0.3, GAP_REASON))
     fixed = dict(known)
     for k in range(2, n + 1):
@@ -304,38 +308,125 @@ def fill_timeline(anchors: dict[int, float], proposals: dict[int, tuple[float, f
     return clean_timeline(raw, n, duration)
 
 
-TEXT_REASON = "matched by slide text"
+TEXT_REASON = "matched by what is said"
+SWITCH, SKIP = 1.0, 1.5  # path costs, in units of "one sentence clearly about this slide": changing slide, skipping one
 
 
-def text_proposals(anchors: dict[int, float], slide_texts: list[str], segments: list[dict], duration: float,
-                   intro: float = 0.0) -> dict[int, tuple[float, float, str]]:
-    """Instant, no AI: for each slide without a cue, the sentence between its placed neighbours whose words (with the
-    next two sentences, if they start within 15 s) cover the most of the slide's words. Slides are taken in order so two missing neighbours
-    cannot swap. A slide covered less than 30% is left for the AI or for interpolation."""
+_embedder = None
+
+
+def local_embed(texts: list[str]) -> np.ndarray:
+    """Meaning vectors on this machine: a small sentence model (all-MiniLM-L6-v2, quantised ONNX, ~21 MB, fetched
+    once from Hugging Face like the Whisper model) run with onnxruntime and tokenizers, which faster-whisper already
+    installs. No quota, no network after the first download, ~0.1 s for a lecture."""
+    global _embedder
+    import onnxruntime as ort
+    from huggingface_hub import hf_hub_download
+    from tokenizers import Tokenizer
+    if _embedder is None:
+        repo = os.getenv("EMBED_MODEL_REPO", "Xenova/all-MiniLM-L6-v2")
+        tok = Tokenizer.from_file(hf_hub_download(repo, "tokenizer.json"))
+        tok.enable_truncation(256)
+        tok.enable_padding()
+        _embedder = (tok, ort.InferenceSession(hf_hub_download(repo, "onnx/model_quantized.onnx"), providers=["CPUExecutionProvider"]))
+    tok, sess = _embedder
+    out = []
+    for i in range(0, len(texts), 64):
+        enc = tok.encode_batch([t or "(empty)" for t in texts[i:i + 64]])
+        ids = np.array([e.ids for e in enc], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
+        feed = {"input_ids": ids, "attention_mask": mask}
+        if any(x.name == "token_type_ids" for x in sess.get_inputs()):
+            feed["token_type_ids"] = np.zeros_like(ids)
+        h = sess.run(None, feed)[0]
+        out.append((h * mask[..., None]).sum(1) / np.maximum(mask.sum(1, keepdims=True), 1))  # mean of the word vectors
+    return np.vstack(out)
+
+
+def similarity(slide_texts: list[str], segments: list[dict]) -> tuple[np.ndarray, str]:
+    """Rows: sentences; columns: slides. Meaning similarity from sentence embeddings plus shared-word coverage
+    (exact terms such as "ADDIE" or "Kirkpatrick" count strongly); words alone when no embedding is available.
+    Each row is standardised (how much more this sentence fits this slide than the others), so a vague sentence
+    counts little and a sentence clearly about one slide counts a lot. Sentences are scored on their own: pairing
+    one with the next made the slide change a sentence early."""
+    windows = [s["text"] for s in segments]
+    texts = [t[:1500] for t in slide_texts] + windows
+    v = None
+    try:
+        v = local_embed(texts)
+    except Exception as e:  # model download or runtime problem: the hosted embeddings next, then shared words
+        print(f"Local embeddings unavailable ({type(e).__name__}: {e}); trying Gemini embeddings", flush=True)
+        try:
+            v = np.array(llm.embed(texts), dtype=float)
+        except llm.LLMError as e2:
+            print(f"Embeddings unavailable, matching by shared words: {e2}", flush=True)
+    def standard(x: np.ndarray) -> np.ndarray:
+        sd = x.std(axis=1, keepdims=True)
+        return (x - x.mean(axis=1, keepdims=True)) / np.where(sd > 1e-9, sd, 1.0)
+
     sw = [_words(t) for t in slide_texts]
-    placed = dict(anchors)
+    words = standard(np.array([[len(w & _words(win)) / max(len(w), 1) for w in sw] for win in windows], dtype=float))
+    if v is None:
+        return words, "shared words"
+    v = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+    return standard(v[len(slide_texts):] @ v[:len(slide_texts)].T) + words, "meaning"
+
+
+def content_proposals(anchors: dict[int, float], slide_texts: list[str], segments: list[dict], duration: float,
+                      intro: float = 0.0) -> tuple[dict[int, tuple[float, float, str]], str]:
+    """Match the whole talk to the deck at once, from what is said (no cue words needed): every sentence after the
+    intro is given to one slide, slides only move forward, and the path that best fits all sentences together wins
+    (changing slide and skipping a slide cost a little, so one stray sentence cannot flip the slide). Spoken cues,
+    if any, are fixed points the path must respect. A slide starts at its first sentence.
+    Returns (slide -> (start, confidence, reason) for slides without a cue, how the similarity was measured)."""
+    n = len(slide_texts)
+    idx = [i for i, s in enumerate(segments) if float(s["start"]) >= intro - 1e-6]
+    if not idx or n == 0:
+        return {}, ""
+    z, how = similarity(slide_texts, [segments[i] for i in idx])
+    if not np.abs(z).max() > 1e-9:  # nothing said resembles any slide more than another: no basis for a timeline
+        return {}, how
+    m = len(idx)
+    allowed = np.ones((m, n), dtype=bool)  # cue constraints: before slide k's cue, below k; after it, k or above
+    for k, t in anchors.items():
+        for r, i in enumerate(idx):
+            s = segments[i]
+            if float(s["start"]) >= t + LEAD - 1e-6:
+                allowed[r, :k - 1] = False
+            elif float(s.get("end", s["start"])) <= t + LEAD:
+                allowed[r, k - 1:] = False
+    NEG = -1e18
+    j = np.arange(n)
+    f = np.where(allowed[0], z[0] - SKIP * j, NEG)  # starting past slide 1 skips the earlier ones
+    came = np.zeros((m, n), dtype=int)
+    for r in range(1, m):
+        best_prev = np.maximum.accumulate(f + SKIP * j)  # best earlier slide, skip cost folded in
+        jump = np.full(n, NEG)
+        jump[1:] = best_prev[:-1] - SKIP * (j[1:] - 1) - SWITCH
+        jump_from = np.zeros(n, dtype=int)
+        arg = np.array([int(np.argmax((f + SKIP * j)[:x])) if x else 0 for x in range(n)])
+        jump_from[1:] = arg[1:]
+        stay_better = f > jump  # on a tie, the slide changes as late as possible: when the speech clearly moves on
+        came[r] = np.where(stay_better, j, jump_from)
+        f = np.where(allowed[r], z[r] + np.maximum(f, jump), NEG)
+    end = int(np.argmax(f - SKIP * (n - 1 - j)))  # stopping before the last slide skips the later ones
+    path = [end]
+    for r in range(m - 1, 0, -1):
+        path.append(int(came[r][path[-1]]))
+    path.reverse()
     out: dict[int, tuple[float, float, str]] = {}
-    for k in range(1, len(slide_texts) + 1):
-        if k in placed or not sw[k - 1]:
-            continue
-        lo = max((t for j, t in placed.items() if j < k), default=-1.0)
-        hi = min((t for j, t in placed.items() if j > k), default=duration)
-        best, at = 0.0, None
-        floor = intro if lo < 0 else lo + MIN_DWELL  # after the intro; leave each neighbour at least MIN_DWELL on screen
-        for i, s in enumerate(segments):
-            t = float(s["start"])
-            if floor <= t <= hi - MIN_DWELL:
-                near = " ".join(x["text"] for x in segments[i:i + 3] if float(x["start"]) < t + 15)
-                cover = len(sw[k - 1] & _words(near)) / len(sw[k - 1])
-                if cover > best:
-                    best, at = cover, t
-        if at is not None and best >= 0.3:
-            out[k] = (at, round(min(0.9, 0.4 + best), 2), TEXT_REASON)
-            placed[k] = at
-    return out
+    for r, k in enumerate(path):
+        slide = k + 1
+        if slide not in out and slide not in anchors:
+            rows = [q for q, kk in enumerate(path) if kk == k]
+            fit = float(np.mean([z[q, k] for q in rows]))  # about 1 = clearly this slide; about 0 = could be any
+            out[slide] = (float(segments[idx[r]]["start"]), round(min(0.95, max(0.3, 0.5 + fit / 4)), 2), TEXT_REASON)
+    return out, how
 
 
 # ---------- AI matching for slides without a cue ----------
+MATCH_MODELS = os.getenv("GEMINI_MATCH_MODEL", "gemini-3.1-flash-lite,gemini-flash-lite-latest,gemini-3.5-flash,gemini-3-flash-preview")  # fast first
+AI_DEADLINE = float(os.getenv("AI_MATCH_SECONDS", "75"))  # the job never waits longer than this for the AI
 STRICT = """
 
 Your previous answer could not be used ({problem}). Reply with ONLY this JSON object and nothing else, no code fences:
@@ -385,7 +476,7 @@ def ai_proposals(slide_texts: list[str], segments: list[dict], duration: float,
     prompt, items, problem = base, [], None
     for _ in range(2):
         try:
-            items = segments_to_times(_timeline_items(llm.generate_json(prompt)), segments)
+            items = segments_to_times(_timeline_items(llm.generate_json(prompt, retries=2, models=MATCH_MODELS)), segments)
             problem = check_timeline(items, n, duration, want)
         except llm.ParseError as e:
             items, problem = [], str(e)
@@ -404,39 +495,44 @@ def guess(n: int, duration: float, why: str) -> dict:
 
 
 def match(slide_texts: list[str], segments: list[dict], duration: float) -> dict:
-    """Returns {timeline, weak, note}. weak=True means the UI must ask the human to review."""
+    """Returns {timeline, weak, note}. Works from what is said; "slide N" cues help but are not needed.
+    weak=True (the UI asks a human) only when nothing could be matched at all: otherwise the job renders on its own."""
     n = len(slide_texts)
     if not segments:
         return guess(n, duration, "no speech was detected")
     anchors = spoken_anchors(segments, slide_texts)
-    # slides without a cue: an instant text match first; the AI (slow on a busy free tier) only if many are still open
     intro = max(0.0, min(intro_end(segments), min(anchors.values(), default=duration) - MIN_DWELL))
-    proposals = text_proposals(anchors, slide_texts, segments, duration, intro) if anchors else {}
-    ai_note = ""
-    if len(anchors) + len(proposals) < n * 0.6:
-        if not llm.available():
-            ai_note = "AI matching is off (GEMINI_API_KEY is not set)"
-        else:
-            try:
-                ai, problem = ai_proposals(slide_texts, segments, duration, anchors)
-                proposals = {**ai, **proposals}  # where both answered, the text match (bounded by the cues) wins
-                ai_note = f"the AI answer was imperfect ({problem})" if problem else ""
-            except llm.LLMError as e:
-                ai_note = f"AI matching failed ({e})"
-    if not anchors and not proposals:
+    ai_job = None
+    if len(anchors) < n * 0.6 and llm.available():  # few cues: ask the AI too, alongside the instant local match
+        ai_job = _ai_pool.submit(ai_proposals, slide_texts, segments, duration, anchors)
+    proposals, how = content_proposals(anchors, slide_texts, segments, duration, intro)
+    backup, ai_note = {}, ""
+    if ai_job is not None:
+        try:
+            ai, problem = ai_job.result(timeout=AI_DEADLINE)
+            if ai:  # the AI reads meaning best; the local match fills any slide it left out or put out of order
+                proposals, backup = ai, proposals
+        except FuturesTimeout:
+            ai_note = f"the AI did not answer within {AI_DEADLINE:.0f} s, so the instant match was used"
+        except llm.LLMError as e:
+            ai_note = f"the AI was unavailable ({e}), so the instant match was used"
+    if not anchors and not proposals and not backup:
         return guess(n, duration, ai_note or "nothing in the speech could be matched to a slide")
-    tl = fill_timeline(anchors, proposals, n, duration, intro)
+    tl = fill_timeline(anchors, proposals, n, duration, intro, backup)
     cue = sum(1 for t in tl if t["reason"] == CUE_REASON)
     gap = sum(1 for t in tl if t["reason"] == GAP_REASON)
     txt = sum(1 for t in tl if t["reason"] == TEXT_REASON)
     ai = len(tl) - cue - gap - txt
-    mean_conf = sum(t["confidence"] for t in tl) / len(tl) if tl else 0
-    parts = [f"{cue} from spoken \"slide N\" cues"] + [f"{txt} by slide text"] * bool(txt) + [f"{ai} by AI matching"] * bool(ai) + [f"{gap} between neighbouring slides (check those)"] * bool(gap)
+    parts = ([f"{txt} by the meaning of what is said" if how == "meaning" else f"{txt} by shared words"] * bool(txt)
+             + [f"{cue} at spoken \"slide N\" cues"] * bool(cue) + [f"{ai} by AI matching"] * bool(ai)
+             + [f"{gap} between neighbouring slides"] * bool(gap))
     note = f"{len(tl)}/{n} slides placed: " + ", ".join(parts) + "."
+    less = [t["slide"] for t in tl if t["confidence"] < 0.6]
+    if less:
+        note += f" Less certain: slide{'s' if len(less) > 1 else ''} {', '.join(map(str, less))}; adjust only if needed."
     if ai_note:
         note += f" Note: {ai_note}."
-    weak = not tl or mean_conf < 0.55 or cue + txt + ai < max(1, n * 0.6)
-    return {"timeline": tl, "weak": weak, "note": ("Please review the timeline. " if weak else "") + note}
+    return {"timeline": tl, "weak": not tl, "note": note}
 
 
 # ---------- background ----------

@@ -95,8 +95,10 @@ def _ollama(prompt: str, images: list[tuple[bytes, str]] | None) -> dict:
     return parse_json(text)
 
 
-def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, retries: int = 6, provider: str | None = None) -> dict:
-    """Return the parsed JSON object from the chosen provider. images = [(bytes, mime)]."""
+def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, retries: int = 6, provider: str | None = None,
+                  models: str | None = None) -> dict:
+    """Return the parsed JSON object from the chosen provider. images = [(bytes, mime)].
+    models: Gemini models to try, in order (comma separated); default GEMINI_MODEL."""
     prov = provider or default_provider()
     if prov == "ollama":
         return _ollama(prompt, images)
@@ -104,7 +106,7 @@ def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, re
         return _openrouter(prompt, images)
     if prov == "auto":  # Gemini first; then OpenRouter's free models (if a key is set); last, the local model
         try:
-            return generate_json(prompt, images, retries, provider="gemini")
+            return generate_json(prompt, images, retries, provider="gemini", models=models)
         except LLMError:
             pass
         if os.getenv("OPENROUTER_API_KEY"):
@@ -124,7 +126,7 @@ def generate_json(prompt: str, images: list[tuple[bytes, str]] | None = None, re
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
     last = ""
-    for model in [m.strip() for m in _model().split(",") if m.strip()]:
+    for model in [m.strip() for m in (models or _model()).split(",") if m.strip()]:
         try:
             return _call(model, body, key, retries)
         except _DailyQuota as e:
@@ -166,6 +168,54 @@ def _call(model: str, body: dict, key: str, retries: int) -> dict:
             raise LLMError(f"Gemini returned no content: {r.text[:300]}")
         return parse_json(text)
     raise LLMError(f"Gemini unavailable after {retries} tries: {last}")
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """Meaning vectors for texts (Gemini embeddings, free tier): similar meaning, nearby vectors, whatever the wording.
+    Sent in batches of 100 in parallel; any failure raises LLMError so the caller can fall back to word matching."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise LLMError("GEMINI_API_KEY is not set")
+    model = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents"
+
+    def batch(chunk: list[str]) -> list[list[float]]:
+        body = {"requests": [{"model": f"models/{model}", "content": {"parts": [{"text": t[:2000] or "(empty)"}]}} for t in chunk]}
+        for attempt in range(3):
+            try:
+                r = httpx.post(url, json=body, headers={"x-goog-api-key": key}, timeout=httpx.Timeout(30, connect=10))
+            except httpx.HTTPError as e:
+                err = f"network error: {e}"
+            else:
+                if r.status_code == 200:
+                    return [e["values"] for e in r.json()["embeddings"]]
+                err = f"HTTP {r.status_code} {r.text[:120]}"
+                if r.status_code not in (429, 500, 503):
+                    break
+            time.sleep(2 * (attempt + 1))
+        raise LLMError(f"Embedding failed: {err}")
+
+    from concurrent.futures import ThreadPoolExecutor
+    chunks = [texts[i:i + 100] for i in range(0, len(texts), 100)]
+    with ThreadPoolExecutor(4) as ex:
+        return [v for part in ex.map(batch, chunks) for v in part]
+
+
+def describe_image(data: bytes, mime: str) -> str:
+    """A one-line description of a slide image, for slides with no text to match against. One fast try only."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise LLMError("GEMINI_API_KEY is not set")
+    model = os.getenv("GEMINI_FAST_MODEL", "gemini-flash-lite-latest")
+    body = {"contents": [{"parts": [{"text": "This is a lecture slide. In one line, give its title and the key topics or labels it shows. Plain text only."},
+                                    {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}]}],
+            "generationConfig": {"temperature": 0}}
+    try:
+        r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", json=body,
+                       headers={"x-goog-api-key": key}, timeout=httpx.Timeout(25, connect=10))
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip() if r.status_code == 200 else ""
+    except (httpx.HTTPError, KeyError, IndexError, ValueError):
+        return ""
 
 
 def parse_json(text: str) -> dict:
